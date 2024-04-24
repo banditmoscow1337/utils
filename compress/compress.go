@@ -2,14 +2,16 @@ package compress
 
 import (
 	"archive/tar"
-	"archive/zip"
 	"bytes"
-	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/klauspost/compress/zip"
+
+	"github.com/klauspost/compress/gzip"
 
 	"github.com/ulikunitz/xz"
 )
