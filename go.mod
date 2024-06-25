@@ -1,4 +1,4 @@
-module utils
+module github.com/banditmoscow1337/utils
 
 go 1.22.4
 
