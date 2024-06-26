@@ -1,12 +1,12 @@
 package email
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 
-	"utils/log"
-
+	"github.com/banditmoscow1337/utils/log"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
@@ -48,12 +48,12 @@ func (m *MailClient) GetMessages(subject string) (string, error) {
 
 	msg := <-messages
 	if msg == nil {
-		return "", log.Err("server didn't returned message")
+		return "", errors.New("server didn't returned message")
 	}
 
 	r := msg.GetBody(&section)
 	if r == nil {
-		return "", log.Err("server didn't returned message body")
+		return "", errors.New("server didn't returned message body")
 	}
 
 	mr, err := mail.CreateReader(r)
@@ -67,7 +67,7 @@ func (m *MailClient) GetMessages(subject string) (string, error) {
 		return "", err
 	}
 	if ms != subject {
-		return "", log.Err("message with subject not found")
+		return "", errors.New("message with subject not found")
 	}
 
 	for {
@@ -85,7 +85,7 @@ func (m *MailClient) GetMessages(subject string) (string, error) {
 		}
 	}
 
-	return "", log.Err("empty message body")
+	return "", errors.New("empty message body")
 }
 
 func Init(email, password string) (*MailClient, error) {

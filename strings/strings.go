@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 func StringToInt(str string) (i int, err error) {
@@ -64,4 +65,23 @@ func RemoveRedundantSpaces(input string) string {
 	re_inside_whtsp := regexp.MustCompile(`[\s\p{Zs}]{2,}`)
 	final := re_leadclose_whtsp.ReplaceAllString(input, "")
 	return re_inside_whtsp.ReplaceAllString(final, " ")
+}
+
+func CFSF(text string) int {
+	for i, r := range strings.Split(text, "") {
+		if r != " " {
+			return i
+		}
+	}
+	return 0
+}
+
+func CFSE(text string) int {
+	split := strings.Split(text, "")
+	for i := len(split) - 1; i >= 0; i-- {
+		if split[i] != " " {
+			return i + 1
+		}
+	}
+	return len(text)
 }

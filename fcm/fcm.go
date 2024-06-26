@@ -2,8 +2,7 @@ package fcm
 
 import (
 	"context"
-
-	"utils/log"
+	"errors"
 
 	firebase "firebase.google.com/go"
 	"firebase.google.com/go/messaging"
@@ -19,15 +18,15 @@ type FCM struct {
 
 func Init(project, account, key string) (fcm *FCM, err error) {
 	if key == "" {
-		return nil, log.Err("key invalid")
+		return nil, errors.New("key invalid")
 	}
 
 	if account == "" {
-		return nil, log.Err("account invalid")
+		return nil, errors.New("account invalid")
 	}
 
 	if project == "" {
-		return nil, log.Err("project invalid")
+		return nil, errors.New("project invalid")
 	}
 
 	fcm = &FCM{project, account, key, nil}
