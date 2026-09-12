@@ -8,10 +8,10 @@
 
 | Benchmark | Iterations | ns/op | B/op | allocs/op |
 |-----------|------------|-------|------|-----------|
-| BenchmarkArena_Alloc_Sequential-8 | 64962202 | 18.29 | 0 | 0 |
-| BenchmarkArena_AllocFree_Parallel-8 | 3048301 | 392.6 | 0 | 0 |
-| BenchmarkArena_LargeAlloc_Parallel-8 | 3265160 | 529.2 | 0 | 0 |
-| BenchmarkArena_AllocBatch-8 | 244356 | 4973 | 0 | 0 |
+| BenchmarkArena_Alloc_Sequential-8 | 45115444 | 26.10 | 0 | 0 |
+| BenchmarkArena_AllocFree_Parallel-8 | 11349417 | 104.1 | 0 | 0 |
+| BenchmarkArena_LargeAlloc_Parallel-8 | 4878450 | 247.9 | 0 | 0 |
+| BenchmarkArena_AllocBatch-8 | 230910 | 5111 | 0 | 0 |
 | BenchmarkArena_GetPtr-8 | 1000000000 | 0.3132 | 0 | 0 |
 | BenchmarkCmpMap/Size_10-8 | 1676319 | 720.6 | 0 | 0 |
 | BenchmarkCmpMap/Size_100-8 | 81204 | 14307 | 0 | 0 |

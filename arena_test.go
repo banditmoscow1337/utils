@@ -2,6 +2,7 @@ package utils
 
 import (
 	"math/rand"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -438,5 +439,91 @@ func BenchmarkArena_GetPtr(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_ = arena.GetPtr(off)
+	}
+}
+
+func reviewArena(t *testing.T) *Arena {
+	t.Helper()
+	a, err := NewArena[uint64](16*1024*1024, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = a.Close() })
+	return a
+}
+
+func TestReviewReuseRestoresRegionAccounting(t *testing.T) {
+	a := reviewArena(t)
+	p := a.AllocDense(120)
+	_ = a.AllocDense(120)
+	r := &a.meta.regions[(p-8)/RegionSize]
+	a.Free(p)
+	q := a.Alloc(120)
+	if q != p {
+		t.Fatalf("setup: got different block %d instead of %d", q, p)
+	}
+	if c, b := r.activeCount.Load(), r.liveBytes.Load(); c != 2 || b != 256 {
+		t.Fatalf("after reuse: activeCount=%d liveBytes=%d; want 2 and 256", c, b)
+	}
+}
+
+func TestReviewDenseBlockIsLargeEnoughWhenReused(t *testing.T) {
+	a := reviewArena(t)
+	p := a.AllocDense(64) // 72-byte block
+	_ = a.AllocDense(120)
+	a.Free(p)
+	q := a.Alloc(120)
+	h := (*BlockHeader)(a.GetPtr(q - 8))
+	if h.Size < 128 {
+		t.Fatalf("120-byte request got only %d payload bytes at %d", h.Size-8, q)
+	}
+}
+
+func TestReviewReuseDoesNotPurgeLiveMemory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("checks Linux anonymous MADV_DONTNEED behavior")
+	}
+	a := reviewArena(t)
+	_ = a.AllocDense(RegionSize - 8)
+	p := a.AllocDense(120)
+	guard := a.AllocDense(120)
+	a.Free(p)
+	q := a.Alloc(120)
+	if q != p {
+		t.Fatal("setup: block was not reused")
+	}
+	const magic = uint64(0x1234567890abcdef)
+	*(*uint64)(a.GetPtr(q)) = magic
+	a.Free(guard)
+	if got := *(*uint64)(a.GetPtr(q)); got != magic {
+		t.Fatalf("live allocation was purged: value=%#x; want %#x", got, magic)
+	}
+}
+
+func TestReviewAllocationSizeDoesNotWrap(t *testing.T) {
+	a := reviewArena(t)
+	defer func() {
+		if recover() == nil {
+			t.Error("Alloc(MaxUint32) returned instead of rejecting impossible size")
+		}
+	}()
+	a.Alloc(^uint32(0))
+}
+
+func TestReviewTLABLiveBytesAreAccountedBeforeFree(t *testing.T) {
+	a := reviewArena(t)
+	p := a.Alloc(64)
+	r := &a.meta.regions[(p-8)/RegionSize]
+	a.Free(p)
+	if b := r.liveBytes.Load(); b < 0 {
+		t.Fatalf("negative liveBytes after one alloc/free: %d", b)
+	}
+}
+
+func TestReviewArenaRejectsTooSmallMapping(t *testing.T) {
+	a, err := NewArena[uint64](uint32(unsafe.Sizeof(uint32(0))), -1)
+	if err == nil {
+		_ = a.Close()
+		t.Fatal("mapping too small for arena metadata was accepted")
 	}
 }
