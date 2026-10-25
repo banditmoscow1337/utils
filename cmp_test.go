@@ -8,6 +8,7 @@ import (
 )
 
 // Helper to easily generate pointers for tests
+//
 //go:fix inline
 func ptr[T any](v T) *T {
 	return new(v)
@@ -142,7 +143,7 @@ func TestCmpPointerValMapSlice(t *testing.T) {
 // --- Benchmarks ---
 func BenchmarkCmpMap(b *testing.B) {
 	sizes := []int{10, 100, 1000}
-	
+
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("Size_%d", size), func(b *testing.B) {
 			m1 := make(map[string]int, size)

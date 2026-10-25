@@ -59,11 +59,11 @@ func HashInteger[T comparable](n T) int {
 		u = uint64(*(*uint8)(unsafe.Pointer(&n)))
 	default:
 		// Acts as a compile-time guard.
-		panic("unsupported generic size") 
+		panic("unsupported generic size")
 	}
 
 	u = FastHasher(u)
-	
+
 	return int(u)
 }
 
@@ -72,7 +72,7 @@ func HashMap[K comparable, V any](m map[K]V, hk func(K) int, hv func(V) int) int
 	for k, v := range m {
 		kh := hk(k)
 		vh := hv(v)
-		
+
 		pairHash := kh ^ (vh + 0x9e3779b9 + (kh << 6) + (kh >> 2))
 		h += pairHash
 	}

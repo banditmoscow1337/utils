@@ -69,7 +69,7 @@ func TestSwissMap_GrowAndRehash(t *testing.T) {
 
 	// Initialize with minimum capacity to force multiple rehashes
 	sm := NewSwissMap[int, int](arena, 8, FastHasherInt)
-	
+
 	const insertCount = 1000
 	for i := 0; i < insertCount; i++ {
 		sm.Put(i, i*10)
@@ -196,7 +196,7 @@ func TestSwissMap_EdgeCases(t *testing.T) {
 	}
 }
 
-// TestSwissMap_InPlaceCompaction forces the map to fill with tombstones 
+// TestSwissMap_InPlaceCompaction forces the map to fill with tombstones
 // until it triggers the in-place memory compaction branch inside Put.
 func TestSwissMap_InPlaceCompaction(t *testing.T) {
 	arena, err := NewArena[int](MaxArenaSize, -1)
@@ -210,7 +210,7 @@ func TestSwissMap_InPlaceCompaction(t *testing.T) {
 
 	// maxLen for cap 16 is 14 (16 * 0.875)
 	// We need length + dead >= 14, and length <= 7 to trigger in-place rehash.
-	
+
 	// 1. Insert 14 items (length=14, dead=0)
 	for i := 0; i < 14; i++ {
 		sm.Put(i, i)
@@ -225,7 +225,7 @@ func TestSwissMap_InPlaceCompaction(t *testing.T) {
 		t.Fatalf("pre-condition failed: expected len=4, dead=10, got len=%d, dead=%d", sm.length, sm.dead)
 	}
 
-	// 3. Put 1 item. length(4) + dead(10) = 14 >= maxLen(14). 
+	// 3. Put 1 item. length(4) + dead(10) = 14 >= maxLen(14).
 	// length(4) <= maxLen/2 (7). This MUST trigger t.rehash(t.capacity).
 	sm.Put(99, 99)
 
@@ -238,7 +238,7 @@ func TestSwissMap_InPlaceCompaction(t *testing.T) {
 	if sm.length != 5 {
 		t.Errorf("expected length to be 5, got %d", sm.length)
 	}
-	
+
 	// Verify data integrity
 	if val, ok := sm.Get(99); !ok || val != 99 {
 		t.Errorf("failed to get newly inserted key post-compaction")
@@ -397,7 +397,7 @@ func TestSwissMap_DifferentialFuzz(t *testing.T) {
 	const keyRange = 2000 // Keep key range constrained to force collisions and updates
 
 	// deterministic seed for reproducibility
-	var seed uint64 = 0x1337 
+	var seed uint64 = 0x1337
 	randInt := func() int {
 		seed ^= seed >> 12
 		seed ^= seed << 25
@@ -475,13 +475,13 @@ func TestSwissMap_UpdateWithoutGrowth(t *testing.T) {
 	defer arena.Close()
 
 	sm := NewSwissMap[int, int](arena, 16, FastHasherInt)
-	
+
 	// Fill exactly to maxLen to avoid capacity growth
 	maxLen := int(float32(16) * 0.875)
 	for i := 0; i < maxLen; i++ {
 		sm.Put(i, i)
 	}
-	
+
 	initialCap := sm.capacity
 
 	// Overwrite all existing keys
@@ -492,7 +492,7 @@ func TestSwissMap_UpdateWithoutGrowth(t *testing.T) {
 	if sm.capacity != initialCap {
 		t.Errorf("map incorrectly grew capacity during updates. initial: %d, current: %d", initialCap, sm.capacity)
 	}
-	
+
 	for i := 0; i < maxLen; i++ {
 		if val, ok := sm.Get(i); !ok || val != i*10 {
 			t.Errorf("update failed for key %d: got %d", i, val)
@@ -592,7 +592,7 @@ func BenchmarkSwissMap_StringKeys(b *testing.B) {
 	defer arena.Close()
 
 	sm := NewSwissMap[string, int](arena, 1024, StringHasher)
-	
+
 	// Pre-generate keys to prevent string allocation overhead during benchmark
 	keys := make([]string, 10000)
 	for i := range keys {
@@ -706,7 +706,7 @@ func BenchmarkSwissMap_MixedWorkload(b *testing.B) {
 	}
 }
 
-// BenchmarkSwissMap_Range_HighlyFragmented measures iteration performance when 
+// BenchmarkSwissMap_Range_HighlyFragmented measures iteration performance when
 // the map contains a vast majority of tombstones, punishing open-addressing designs.
 func BenchmarkSwissMap_Range_HighlyFragmented(b *testing.B) {
 	arena, err := NewArena[int](MaxArenaSize, -1)
@@ -716,7 +716,7 @@ func BenchmarkSwissMap_Range_HighlyFragmented(b *testing.B) {
 	defer arena.Close()
 
 	sm := NewSwissMap[int, int](arena, 65536, FastHasherInt)
-	
+
 	// Insert 50,000 items
 	for i := 0; i < 50000; i++ {
 		sm.Put(i, i)
@@ -741,7 +741,7 @@ func BenchmarkSwissMap_Range_HighlyFragmented(b *testing.B) {
 
 func BenchmarkStdMap_Range_HighlyFragmented(b *testing.B) {
 	m := make(map[int]int, 65536)
-	
+
 	for i := 0; i < 50000; i++ {
 		m[i] = i
 	}

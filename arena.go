@@ -135,14 +135,13 @@ func (a *Arena) AllocDense(size uint64) uint64 {
 		return 0
 	}
 	total := blockSize64(size)
-	if class, rounded := GetSizeClass(uint32(total)); class != -1 {
-		total = uint64(rounded)
+	if class, rounded := GetSizeClass(total); class != -1 {
+		total = rounded
 	}
 	return a.AllocBatch(total-blockHeaderSize64, 1)
 }
 
-
-func GetSizeClass(size uint32) (int, uint32) {
+func GetSizeClass(size uint64) (int, uint64) {
 	switch {
 	case size <= 64:
 		return 0, 64
@@ -233,11 +232,11 @@ func (a *Arena) Alloc(size uint64) uint64 {
 		return 0
 	}
 	allocSize := blockSize64(size)
-	if class, rounded := GetSizeClass(uint32(allocSize)); class != -1 {
+	if class, rounded := GetSizeClass(allocSize); class != -1 {
 		if head, _, count := a.PopBatch(class, 1); count > 0 {
 			return head
 		}
-		allocSize = uint64(rounded)
+		allocSize = rounded
 	}
 	if allocSize > TLABChunkSize/2 {
 		return a.AllocDense(size)
@@ -298,9 +297,9 @@ func (a *Arena) Free(offset uint64) {
 	if bump > start+(RegionSize*2)/5 && live > 0 && float64(live)/RegionSize < RelocationWatermark {
 		region.evacuate.Store(1)
 	}
-	class, rounded := GetSizeClass(uint32(size))
+	class, rounded := GetSizeClass(size)
 	// Exact-sized blocks may only join a class if they physically fill it.
-	if class != -1 && uint64(rounded) == size && region.evacuate.Load() == 0 {
+	if class != -1 && rounded == size && region.evacuate.Load() == 0 {
 		headAddr := &region.freeHeads[class]
 		head := lockHead64(headAddr)
 		hdr.NextFree = head

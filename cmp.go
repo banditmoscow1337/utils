@@ -71,7 +71,7 @@ func CmpPointerVal[T cmp.Ordered](a, b *T) int {
 	if b == nil {
 		return 1
 	}
-	
+
 	if *a < *b {
 		return -1
 	}
@@ -150,13 +150,13 @@ func ComparePointer[T any](a, b *T, elemCmp func(T, T) error) error {
 	return elemCmp(*a, *b)
 }
 
-// ComparePointerKeyMap handles maps where the key is a pointer. 
+// ComparePointerKeyMap handles maps where the key is a pointer.
 // Standard lookup fails because unmarshalling allocates new addresses.
 func ComparePointerKeyMap[K comparable, V any](a, b map[*K]V, valCmp func(V, V) error) error {
 	if len(a) != len(b) {
 		return fmt.Errorf("length mismatch: %d != %d", len(a), len(b))
 	}
-	
+
 	// We must iterate because we cannot look up by pointer address
 	for k1, v1 := range a {
 		found := false

@@ -28,18 +28,18 @@ var FixedSizeTypes = map[string]bool{
 
 // GenContext holds the shared state of the generation process (AST info).
 type GenContext struct {
-	InputFile, PkgName, BaseName, OutputDir   string
-	TypeSpecs map[string]*ast.TypeSpec
-	Types []*ast.TypeSpec
-	buf bytes.Buffer
+	InputFile, PkgName, BaseName, OutputDir string
+	TypeSpecs                               map[string]*ast.TypeSpec
+	Types                                   []*ast.TypeSpec
+	buf                                     bytes.Buffer
 }
 
 // NewContext creates a new shared context.
 func NewContext(inputFile string) (ctx *GenContext) {
-	ctx =  &GenContext{
+	ctx = &GenContext{
 		InputFile: inputFile,
 		TypeSpecs: make(map[string]*ast.TypeSpec),
-		BaseName: strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(inputFile)),
+		BaseName:  strings.TrimSuffix(filepath.Base(inputFile), filepath.Ext(inputFile)),
 		OutputDir: filepath.Dir(inputFile),
 	}
 
@@ -221,8 +221,8 @@ func (ctx *GenContext) formatGo(prefix string) (err error) {
 
 	ctx.buf.Reset()
 
-	if _, err = ctx.buf.Write(src); err!=nil {
-		return 
+	if _, err = ctx.buf.Write(src); err != nil {
+		return
 	}
 
 	ctx.WriteFile(&ctx.buf, prefix, "go")
@@ -270,6 +270,7 @@ func (ctx *GenContext) generateGoTestGenerator(ts *ast.TypeSpec) {
 func (ctx *GenContext) printf(format string, args ...interface{}) {
 	_, _ = fmt.Fprintf(&ctx.buf, format, args...)
 }
+
 type typeGenInfo struct {
 	TypeName      string
 	TestGenerator string
@@ -328,11 +329,11 @@ func (ctx *GenContext) getTypeInfo(expr ast.Expr) typeGenInfo {
 
 	case *ast.ArrayType:
 		eltInfo := ctx.getTypeInfo(t.Elt)
-		
+
 		if t.Len != nil {
 			// Fixed Array logic
 			lenStr := ctx.ExprToString(t.Len)
-			
+
 			// Generator construction
 			genCall := eltInfo.TestGenerator
 			if strings.HasPrefix(genCall, "func") {
@@ -340,13 +341,13 @@ func (ctx *GenContext) getTypeInfo(expr ast.Expr) typeGenInfo {
 			} else {
 				genCall = fmt.Sprintf("%s(r, d)", genCall)
 			}
-			
+
 			testGen := fmt.Sprintf("func(r *rand.Rand, d int) %s { var v %s; for i := 0; i < %s; i++ { v[i] = %s }; return v }", typeName, typeName, lenStr, genCall)
 
 			return typeGenInfo{
-				TypeName: typeName,
+				TypeName:      typeName,
 				TestGenerator: testGen,
-				IsFixedSize: eltInfo.IsFixedSize,
+				IsFixedSize:   eltInfo.IsFixedSize,
 			}
 		}
 
@@ -358,13 +359,12 @@ func (ctx *GenContext) getTypeInfo(expr ast.Expr) typeGenInfo {
 	case *ast.MapType:
 		keyInfo := ctx.getTypeInfo(t.Key)
 		valInfo := ctx.getTypeInfo(t.Value)
-		
+
 		// Check if Key is a pointer
 
 		return typeGenInfo{
 			TypeName:      typeName,
 			TestGenerator: fmt.Sprintf("func(r *rand.Rand, d int) %s { return utils.GenerateMap(r, d, %s, %s) }", typeName, keyInfo.TestGenerator, valInfo.TestGenerator),
-			
 		}
 	}
 	return typeGenInfo{TypeName: typeName}

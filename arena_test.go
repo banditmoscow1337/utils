@@ -54,9 +54,9 @@ func TestArena_BasicAllocAndFree(t *testing.T) {
 // TestArena_GetSizeClass ensures allocations are strictly rounded to internal slabs.
 func TestArena_GetSizeClass(t *testing.T) {
 	tests := []struct {
-		size        uint32
+		size        uint64
 		expectedIdx int
-		expectedSz  uint32
+		expectedSz  uint64
 	}{
 		{0, 0, 64},
 		{32, 0, 64},
