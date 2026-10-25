@@ -20,54 +20,73 @@ const (
 	SizeClassCount      = 9
 )
 
-type Region struct {
-	activeCount atomic.Int32  // 4 bytes
-	liveBytes   atomic.Int32  // 4 bytes
-	evacuate    atomic.Uint32 // 4 bytes
-	users       atomic.Int32  // >= 0: allocator leases; -1: exclusive purge
-	freeHeads   [10]uint64    // 80 bytes
-	_           [32]byte      // 32 bytes: Pad to exactly 128 bytes (16 + 80 + 32)
+// Arena keeps 64-bit offsets throughout the allocator. Its mapped layout is
+// different from Arena's; a file mapped with one format must not be opened with
+// the other. Allocations still fit within a single RegionSize-sized region.
+//
+// The metadata grows with the mapping instead of reserving space for every
+// possible 64-bit offset. As with Arena, Close requires all users to be done.
+type Arena struct {
+	basePtr   unsafe.Pointer
+	size      uint64
+	dataStart uint64
+	meta      *arenaMeta
+	regions   []Region
+	tlabPool  sync.Pool
+	tlabHead  atomic.Pointer[localTLAB]
 }
 
 type arenaMeta struct {
-	bumpOffset uint32
-	_          PadCacheLineMinus4 // Isolate highly contended bumpOffset from the regions array
-	regions    [MaxRegions]Region
+	bumpOffset  uint64
+	magic       uint64
+	mappingSize uint64
+	_           [CacheLineSize - 24]byte
 }
 
-type blockHeader struct {
-	size     uint32
-	nextFree uint32
+const arenaMagic = uint64(0x6172656e61363401)
+
+// Region64 uses the low bit of each free-list head as a short-lived lock.
+// Block payload offsets are multiples of eight, so the bit is always free.
+// This serializes access to NextFree without a 128-bit CAS or per-free heap
+// allocation, and permits the entire uint64 range of offsets (no tag wrap).
+type Region struct {
+	activeCount atomic.Int32
+	liveBytes   atomic.Int32
+	evacuate    atomic.Uint32
+	users       atomic.Int32
+	freeHeads   [SizeClassCount]uint64
+	_           [40]byte // 16 + 72 + 40 = 128 bytes.
 }
 
+// BlockHeader64 precedes each allocated payload. Size includes the header.
 type BlockHeader struct {
-	Size     uint32
-	NextFree uint32
-}
-
-type Arena struct {
-	basePtr  unsafe.Pointer
-	size     uint32
-	_        uint32
-	meta     *arenaMeta
-	tlabPool sync.Pool
-	// Own reservations even if sync.Pool drops cached entries.
-	tlabHead atomic.Pointer[localTLAB]
+	Size     uint64
+	NextFree uint64
 }
 
 type localTLAB struct {
-	offset    uint32
+	offset    uint64
 	rem       uint32
 	claims    int32
-	regionIdx uint32
+	regionIdx uint64
 	inUse     atomic.Bool
 	_         [4]byte
 	next      *localTLAB // Immutable after registration.
-	_         [CacheLineSize - 32]byte
+	_         [CacheLineSize - 40]byte
 }
 
-func NewArena[T any](size uint32, fd int) (*Arena, error) {
-	if uint64(size) < uint64(unsafe.Sizeof(arenaMeta{}))+8 {
+const blockHeaderSize64 = uint64(unsafe.Sizeof(BlockHeader{}))
+
+// NewArena maps size bytes. The mapping must have room for its variable-sized
+// region table; fd == -1 creates a private anonymous mapping.
+func NewArena[T any](size uint64, fd int) (*Arena, error) {
+	if size > uint64(int(^uint(0)>>1)) {
+		return nil, errors.New("invalid arena size: mapping exceeds int")
+	}
+	regionCount := (size + RegionSize - 1) / RegionSize
+	metaSize := uint64(unsafe.Sizeof(arenaMeta{})) + regionCount*uint64(unsafe.Sizeof(Region{}))
+	dataStart := (metaSize + 7) &^ uint64(7)
+	if size < dataStart+blockHeaderSize64+8 {
 		return nil, errors.New("invalid arena size: mapping cannot hold metadata")
 	}
 
@@ -75,23 +94,53 @@ func NewArena[T any](size uint32, fd int) (*Arena, error) {
 	if fd == -1 {
 		flags = unix.MAP_ANON | unix.MAP_PRIVATE
 	}
-
 	b, err := unix.Mmap(fd, 0, int(size), unix.PROT_READ|unix.PROT_WRITE, flags)
 	if err != nil {
 		return nil, err
 	}
-
-	arena := &Arena{
-		basePtr: unsafe.Pointer(&b[0]),
-		size:    size,
+	a := &Arena{
+		basePtr:   unsafe.Pointer(&b[0]),
+		size:      size,
+		dataStart: dataStart,
 	}
-	arena.meta = (*arenaMeta)(arena.basePtr)
-	if atomic.LoadUint32(&arena.meta.bumpOffset) == 0 {
-		atomic.StoreUint32(&arena.meta.bumpOffset, uint32(unsafe.Sizeof(arenaMeta{}))+8)
+	a.meta = (*arenaMeta)(a.basePtr)
+	a.regions = unsafe.Slice((*Region)(unsafe.Add(a.basePtr, unsafe.Sizeof(arenaMeta{}))), int(regionCount))
+	if atomic.LoadUint64(&a.meta.bumpOffset) == 0 {
+		atomic.CompareAndSwapUint64(&a.meta.magic, 0, arenaMagic)
+		atomic.CompareAndSwapUint64(&a.meta.mappingSize, 0, size)
+		if atomic.LoadUint64(&a.meta.magic) == arenaMagic &&
+			atomic.LoadUint64(&a.meta.mappingSize) == size {
+			atomic.CompareAndSwapUint64(&a.meta.bumpOffset, 0, dataStart)
+		}
 	}
-
-	return arena, nil
+	bump := atomic.LoadUint64(&a.meta.bumpOffset)
+	if atomic.LoadUint64(&a.meta.magic) != arenaMagic ||
+		atomic.LoadUint64(&a.meta.mappingSize) != size ||
+		bump < dataStart || bump > size {
+		_ = unix.Munmap(b)
+		return nil, errors.New("invalid arena metadata or mapping size")
+	}
+	return a, nil
 }
+
+func (a *Arena) NeedsEvacuation(offset uint64) bool {
+	if offset == 0 {
+		return false
+	}
+	return a.regions[offset/RegionSize].evacuate.Load() == 1
+}
+
+func (a *Arena) AllocDense(size uint64) uint64 {
+	if size == 0 {
+		return 0
+	}
+	total := blockSize64(size)
+	if class, rounded := GetSizeClass(uint32(total)); class != -1 {
+		total = uint64(rounded)
+	}
+	return a.AllocBatch(total-blockHeaderSize64, 1)
+}
+
 
 func GetSizeClass(size uint32) (int, uint32) {
 	switch {
@@ -118,102 +167,84 @@ func GetSizeClass(size uint32) (int, uint32) {
 	}
 }
 
-func (a *Arena) NeedsEvacuation(offset uint32) bool {
-	if offset == 0 {
-		return false
-	}
-	return a.meta.regions[offset/RegionSize].evacuate.Load() == 1
-}
-
-func (a *Arena) AllocDense(size uint32) uint32 {
-	if size == 0 {
-		return 0
-	}
-	total := blockSize(size)
-	if class, rounded := GetSizeClass(total); class != -1 {
-		total = rounded
-	}
-	return a.AllocBatch(total-8, 1)
-}
-
 // AllocChunk reserves raw bytes including caller-written block headers.
 // count is the number of block claims transferred to the caller.
-func (a *Arena) AllocChunk(size uint32, count int32) uint32 {
-	aligned := (uint64(size) + 7) &^ uint64(7)
-	if aligned == 0 || aligned > RegionSize {
+func (a *Arena) AllocChunk(size uint64, count int32) uint64 {
+	if size == 0 || size > RegionSize {
 		panic("utils: invalid arena chunk size")
 	}
-	return a.reserve(uint32(aligned), count)
+	aligned := (size + 7) &^ uint64(7)
+	if aligned > RegionSize {
+		panic("utils: invalid arena chunk size")
+	}
+	return a.reserve(aligned, count)
 }
 
-func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint32, count int) {
+func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint64, count int) {
 	if classIdx < 0 || classIdx >= SizeClassCount || max <= 0 {
 		return 0, 0, 0
 	}
-	startRegion := atomic.LoadUint32(&a.meta.bumpOffset) / RegionSize
-	if startRegion >= MaxRegions {
-		startRegion = MaxRegions - 1
+	startRegion := atomic.LoadUint64(&a.meta.bumpOffset) / RegionSize
+	if startRegion >= uint64(len(a.regions)) {
+		startRegion = uint64(len(a.regions) - 1)
 	}
 	for r := int(startRegion); r >= 0; r-- {
-		region := &a.meta.regions[r]
+		region := &a.regions[r]
 		headAddr := &region.freeHeads[classIdx]
-		if region.evacuate.Load() == 1 || uint32(atomic.LoadUint64(headAddr)) == 0 {
+		if region.evacuate.Load() == 1 || atomic.LoadUint64(headAddr) == 0 {
 			continue
 		}
-		// Retain the lease until every removed block has restored its claims.
+		// Keep the region leased until the removed blocks regain their claims.
 		region.enter()
 		if region.evacuate.Load() == 1 {
-			a.leaveRegion(uint32(r))
+			a.leaveRegion(uint64(r))
 			continue
 		}
-		for {
-			curr := atomic.LoadUint64(headAddr)
-			tag, head := unpackTaggedPtr(curr)
-			if head == 0 {
-				break
-			}
-			last := head
-			hdr := (*BlockHeader)(a.GetPtr(last - 8))
-			next := atomic.LoadUint32(&hdr.NextFree)
-			bytes := int32(hdr.Size)
-			count = 1
-			for count < max && next != 0 {
-				last = next
-				hdr = (*BlockHeader)(a.GetPtr(last - 8))
-				next = atomic.LoadUint32(&hdr.NextFree)
-				bytes += int32(hdr.Size)
-				count++
-			}
-			if atomic.CompareAndSwapUint64(headAddr, curr, packTaggedPtr(tag+1, next)) {
-				region.activeCount.Add(int32(count))
-				region.liveBytes.Add(bytes)
-				atomic.StoreUint32(&hdr.NextFree, 0)
-				a.leaveRegion(uint32(r))
-				return head, last, count
-			}
+		head := lockHead64(headAddr)
+		if head == 0 {
+			unlockHead64(headAddr, 0)
+			a.leaveRegion(uint64(r))
+			continue
 		}
-		a.leaveRegion(uint32(r))
+		last := head
+		hdr := (*BlockHeader)(a.GetPtr(last - blockHeaderSize64))
+		next := hdr.NextFree
+		bytes := int32(hdr.Size)
+		count = 1
+		for count < max && next != 0 {
+			last = next
+			hdr = (*BlockHeader)(a.GetPtr(last - blockHeaderSize64))
+			next = hdr.NextFree
+			bytes += int32(hdr.Size)
+			count++
+		}
+		region.activeCount.Add(int32(count))
+		region.liveBytes.Add(bytes)
+		hdr.NextFree = 0
+		unlockHead64(headAddr, next)
+		a.leaveRegion(uint64(r))
+		return head, last, count
 	}
 	return 0, 0, 0
 }
 
-func (a *Arena) Alloc(size uint32) uint32 {
+func (a *Arena) Alloc(size uint64) uint64 {
 	if size == 0 {
 		return 0
 	}
-	allocSize := blockSize(size)
-	if class, rounded := GetSizeClass(allocSize); class != -1 {
+	allocSize := blockSize64(size)
+	if class, rounded := GetSizeClass(uint32(allocSize)); class != -1 {
 		if head, _, count := a.PopBatch(class, 1); count > 0 {
 			return head
 		}
-		allocSize = rounded
+		allocSize = uint64(rounded)
 	}
 	if allocSize > TLABChunkSize/2 {
 		return a.AllocDense(size)
 	}
 	t := a.acquireTLAB()
 	defer a.releaseTLAB(t)
-	if t.rem < allocSize || (t.offset != 0 && a.NeedsEvacuation(t.offset)) {
+	if uint64(t.rem) < allocSize || (t.offset != 0 && a.NeedsEvacuation(t.offset)) {
 		a.refundTLAB(t)
 		t.offset = a.reserve(TLABChunkSize, TLABChunkSize/64)
 		t.rem = TLABChunkSize
@@ -223,20 +254,20 @@ func (a *Arena) Alloc(size uint32) uint32 {
 	off := t.offset
 	hdr := (*BlockHeader)(a.GetPtr(off))
 	hdr.Size = allocSize
-	atomic.StoreUint32(&hdr.NextFree, 0)
+	hdr.NextFree = 0
 	t.offset += allocSize
-	t.rem -= allocSize
+	t.rem -= uint32(allocSize)
 	t.claims--
-	return off + 8
+	return off + blockHeaderSize64
 }
 
 // AddActiveCount adjusts claims for a reservation already owned by the caller.
-func (a *Arena) AddActiveCount(offset uint32, delta int32) {
+func (a *Arena) AddActiveCount(offset uint64, delta int32) {
 	if offset == 0 || delta == 0 {
 		return
 	}
 	idx := offset / RegionSize
-	region := &a.meta.regions[idx]
+	region := &a.regions[idx]
 	region.enter()
 	region.activeCount.Add(delta)
 	a.leaveRegion(idx)
@@ -244,80 +275,74 @@ func (a *Arena) AddActiveCount(offset uint32, delta int32) {
 
 // AllocBatch reserves one payload with count block claims. For raw storage
 // split into independently freed blocks, use AllocChunk.
-func (a *Arena) AllocBatch(size uint32, count int32) uint32 {
-	total := blockSize(size)
+func (a *Arena) AllocBatch(size uint64, count int32) uint64 {
+	total := blockSize64(size)
 	off := a.reserve(total, count)
 	hdr := (*BlockHeader)(a.GetPtr(off))
 	hdr.Size = total
-	atomic.StoreUint32(&hdr.NextFree, 0)
-	return off + 8
+	hdr.NextFree = 0
+	return off + blockHeaderSize64
 }
 
-func (a *Arena) Free(offset uint32) {
+func (a *Arena) Free(offset uint64) {
 	if offset == 0 {
 		return
 	}
-	hdr := (*BlockHeader)(a.GetPtr(offset - 8))
-	idx := (offset - 8) / RegionSize
-	region := &a.meta.regions[idx]
+	hdr := (*BlockHeader)(a.GetPtr(offset - blockHeaderSize64))
+	idx := (offset - blockHeaderSize64) / RegionSize
+	region := &a.regions[idx]
 	size := hdr.Size
 	live := region.liveBytes.Add(-int32(size))
-	start := uint64(idx) * RegionSize
-	bump := uint64(atomic.LoadUint32(&a.meta.bumpOffset))
+	start := idx * RegionSize
+	bump := atomic.LoadUint64(&a.meta.bumpOffset)
 	if bump > start+(RegionSize*2)/5 && live > 0 && float64(live)/RegionSize < RelocationWatermark {
 		region.evacuate.Store(1)
 	}
-	class, rounded := GetSizeClass(size)
+	class, rounded := GetSizeClass(uint32(size))
 	// Exact-sized blocks may only join a class if they physically fill it.
-	if class != -1 && rounded == size && region.evacuate.Load() == 0 {
+	if class != -1 && uint64(rounded) == size && region.evacuate.Load() == 0 {
 		headAddr := &region.freeHeads[class]
-		for {
-			curr := atomic.LoadUint64(headAddr)
-			tag, head := unpackTaggedPtr(curr)
-			atomic.StoreUint32(&hdr.NextFree, head)
-			if atomic.CompareAndSwapUint64(headAddr, curr, packTaggedPtr(tag+1, offset)) {
-				break
-			}
-		}
+		head := lockHead64(headAddr)
+		hdr.NextFree = head
+		unlockHead64(headAddr, offset)
 	}
-	// Until this decrement, ownership of this block itself prevents purge.
+	// This block's own claim prevents purge until after its list update.
 	if region.activeCount.Add(-1) == 0 {
 		a.purgeRegion(idx)
 	}
 }
 
-// reserve publishes the bump and reservation counters under one region lease.
-func (a *Arena) reserve(size uint32, count int32) uint32 {
+func (a *Arena) reserve(size uint64, count int32) uint64 {
 	if size == 0 || size > RegionSize || count <= 0 {
 		panic("utils: invalid arena reservation")
 	}
 	for {
-		old := atomic.LoadUint32(&a.meta.bumpOffset)
-		start := uint64(old)
-		rem := uint64(RegionSize - old%RegionSize)
-		if uint64(size) > rem {
+		old := atomic.LoadUint64(&a.meta.bumpOffset)
+		start := old
+		rem := uint64(RegionSize) - old%RegionSize
+		if size > rem {
 			start += rem
 		}
-		end := start + uint64(size)
-		if start >= uint64(a.size) || end > uint64(a.size) {
-			panic("art: mmap arena OOM")
+		end := start + size
+		if start >= a.size || end > a.size {
+			panic("utils: mmap arena OOM")
 		}
-		idx := uint32(start) / RegionSize
-		region := &a.meta.regions[idx]
+		idx := start / RegionSize
+		region := &a.regions[idx]
 		region.enter()
-		if !atomic.CompareAndSwapUint32(&a.meta.bumpOffset, old, uint32(end)) {
+		if !atomic.CompareAndSwapUint64(&a.meta.bumpOffset, old, end) {
 			a.leaveRegion(idx)
 			continue
 		}
 		region.activeCount.Add(count)
 		region.liveBytes.Add(int32(size))
 		a.leaveRegion(idx)
-		return uint32(start)
+		return start
 	}
 }
 
-func (a *Arena) purgeRegion(idx uint32) {
-	region := &a.meta.regions[idx]
+func (a *Arena) purgeRegion(idx uint64) {
+	region := &a.regions[idx]
 	if region.activeCount.Load() != 0 || !region.users.CompareAndSwap(0, -1) {
 		return
 	}
@@ -326,18 +351,17 @@ func (a *Arena) purgeRegion(idx uint32) {
 		return
 	}
 	for i := range region.freeHeads {
-		tag, _ := unpackTaggedPtr(atomic.LoadUint64(&region.freeHeads[i]))
-		atomic.StoreUint64(&region.freeHeads[i], packTaggedPtr(tag+1, 0))
+		// A region lease prevents any concurrent PopBatch while users == -1.
+		atomic.StoreUint64(&region.freeHeads[i], 0)
 	}
 	region.liveBytes.Store(0)
 	region.evacuate.Store(0)
-	start := uint64(idx) * RegionSize
-	end := min(start+RegionSize, uint64(a.size))
+	start := idx * RegionSize
+	end := min(start+RegionSize, a.size)
 	page := uint64(unix.Getpagesize())
-	if idx == 0 {
-		metaEnd := uint64(unsafe.Sizeof(arenaMeta{})) + 8
-		start = (metaEnd + page - 1) &^ (page - 1)
-	}
+	// For large mappings the region table itself spans multiple regions.
+	// Preserve every metadata page, not just pages in region zero.
+	start = max(start, (a.dataStart+page-1)&^(page-1))
 	end &^= page - 1
 	if start >= end {
 		return
@@ -346,12 +370,24 @@ func (a *Arena) purgeRegion(idx uint32) {
 	_ = unix.Madvise(unsafe.Slice((*byte)(ptr), int(end-start)), unix.MADV_DONTNEED)
 }
 
-func packTaggedPtr(tag, offset uint32) uint64 {
-	return (uint64(tag) << 32) | uint64(offset)
+// lockHead64 returns the payload offset without the lock bit.
+func lockHead64(addr *uint64) uint64 {
+	spins := 0
+	for {
+		old := atomic.LoadUint64(addr)
+		if old&1 == 0 && atomic.CompareAndSwapUint64(addr, old, old|1) {
+			return old
+		}
+		spins++
+		if spins == 16 {
+			runtime.Gosched()
+			spins = 0
+		}
+	}
 }
 
-func unpackTaggedPtr(val uint64) (uint32, uint32) {
-	return uint32(val >> 32), uint32(val)
+func unlockHead64(addr *uint64, offset uint64) {
+	atomic.StoreUint64(addr, offset)
 }
 
 //go:nosplit
@@ -359,8 +395,7 @@ func (a *Arena) BasePtr() unsafe.Pointer {
 	return a.basePtr
 }
 
-//go:fix inline
-func (a *Arena) GetPtr(offset uint32) unsafe.Pointer {
+func (a *Arena) GetPtr(offset uint64) unsafe.Pointer {
 	if offset == 0 {
 		return nil
 	}
@@ -368,38 +403,41 @@ func (a *Arena) GetPtr(offset uint32) unsafe.Pointer {
 }
 
 //go:nosplit
-func (a *Arena) GetOffset(ptr unsafe.Pointer) uint32 {
+func (a *Arena) GetOffset(ptr unsafe.Pointer) uint64 {
 	if ptr == nil {
 		return 0
 	}
 	diff := uintptr(ptr) - uintptr(a.basePtr)
-	if diff >= uintptr(a.size) {
-		panic("art: pointer outside arena")
+	if uint64(diff) >= a.size {
+		panic("utils: pointer outside arena")
 	}
-	return uint32(diff)
+	return uint64(diff)
 }
 
-//go:nosplit
+// Close is idempotent after a successful unmap.
 func (a *Arena) Close() error {
 	if a.basePtr == nil {
 		return nil
 	}
-
-	b := unsafe.Slice((*byte)(a.basePtr), a.size)
+	b := unsafe.Slice((*byte)(a.basePtr), int(a.size))
 	err := unix.Munmap(b)
 	if err == nil {
 		a.basePtr = nil
+		a.meta = nil
+		a.regions = nil
 	}
 	return err
 }
 
-// A block may not straddle regions: accounting and purge are region-local.
-func blockSize(size uint32) uint32 {
-	total := ((uint64(size) + 7) &^ uint64(7)) + 8
+func blockSize64(size uint64) uint64 {
+	if size > RegionSize-blockHeaderSize64 {
+		panic("utils: allocation exceeds one arena region")
+	}
+	total := ((size + 7) &^ uint64(7)) + blockHeaderSize64
 	if total > RegionSize {
 		panic("utils: allocation exceeds one arena region")
 	}
-	return uint32(total)
+	return total
 }
 
 func (r *Region) enter() {
@@ -412,8 +450,8 @@ func (r *Region) enter() {
 	}
 }
 
-func (a *Arena) leaveRegion(idx uint32) {
-	r := &a.meta.regions[idx]
+func (a *Arena) leaveRegion(idx uint64) {
+	r := &a.regions[idx]
 	if r.users.Add(-1) == 0 && r.activeCount.Load() == 0 {
 		a.purgeRegion(idx)
 	}
@@ -426,7 +464,7 @@ func (a *Arena) acquireTLAB() *localTLAB {
 			if t.inUse.CompareAndSwap(false, true) {
 				return t
 			}
-			continue // A cached alias is already held by a registry borrower.
+			continue
 		}
 		for t := a.tlabHead.Load(); t != nil; t = t.next {
 			if t.inUse.CompareAndSwap(false, true) {
@@ -454,9 +492,8 @@ func (a *Arena) refundTLAB(t *localTLAB) {
 	if t.offset == 0 {
 		return
 	}
-	region := &a.meta.regions[t.regionIdx]
+	region := &a.regions[t.regionIdx]
 	region.enter()
-	// liveBytes includes the unused tail until this explicit refund.
 	region.liveBytes.Add(-int32(t.rem))
 	region.activeCount.Add(-t.claims)
 	t.offset, t.rem, t.claims = 0, 0, 0

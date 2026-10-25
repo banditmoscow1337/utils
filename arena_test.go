@@ -1,3 +1,5 @@
+// Mirrors arena_test.go: 19 tests and five benchmarks with the same workloads.
+// Differences account for uint64 offsets, the 16-byte header, and the head lock.
 package utils
 
 import (
@@ -73,25 +75,28 @@ func TestArena_GetSizeClass(t *testing.T) {
 	for _, tc := range tests {
 		idx, sz := GetSizeClass(tc.size)
 		if idx != tc.expectedIdx || sz != tc.expectedSz {
-			t.Errorf("GetSizeClass(%d) = (%d, %d), expected (%d, %d)", 
+			t.Errorf("GetSizeClass(%d) = (%d, %d), expected (%d, %d)",
 				tc.size, idx, sz, tc.expectedIdx, tc.expectedSz)
 		}
 	}
 }
 
-// TestArena_PointerTagging verifies the ABA prevention mechanism for the lock-free free lists.
-func TestArena_PointerTagging(t *testing.T) {
-	tag := uint32(42)
-	offset := uint32(1024)
-	packed := packTaggedPtr(tag, offset)
-	unpackedTag, unpackedOff := unpackTaggedPtr(packed)
-
-	if unpackedTag != tag || unpackedOff != offset {
-		t.Fatalf("Tagging mismatch: expected (%d, %d), got (%d, %d)", tag, offset, unpackedTag, unpackedOff)
+// TestArena_HeadLock verifies that the list lock preserves all 64 offset bits.
+func TestArena_HeadLock(t *testing.T) {
+	var head uint64 = 1<<32 + 1024
+	if locked := lockHead64(&head); locked != 1<<32+1024 {
+		t.Fatalf("locked head = %d; want %d", locked, uint64(1<<32+1024))
+	}
+	if got := atomic.LoadUint64(&head); got != 1<<32+1025 {
+		t.Fatalf("lock bit or upper offset bits lost: %#x", got)
+	}
+	unlockHead64(&head, 1<<32+2048)
+	if got := atomic.LoadUint64(&head); got != 1<<32+2048 {
+		t.Fatalf("unlocked head = %d; want %d", got, uint64(1<<32+2048))
 	}
 }
 
-// TestArena_FreeListReuse ensures that objects freed into size-class lists are correctly 
+// TestArena_FreeListReuse ensures that objects freed into size-class lists are correctly
 // popped back out without bumping the global allocation offset.
 func TestArena_FreeListReuse(t *testing.T) {
 	arena, err := NewArena[int](MaxArenaSize, -1)
@@ -100,32 +105,32 @@ func TestArena_FreeListReuse(t *testing.T) {
 	}
 	defer arena.Close()
 
-	// Sentinel allocation: keeps activeCount > 0, preventing purgeRegion 
+	// Sentinel allocation: keeps activeCount > 0, preventing purgeRegion
 	// from destroying the free list when the batch is freed.
 	_ = arena.Alloc(8)
 
-	var offsets []uint32
+	var offsets []uint64
 	for i := 0; i < 10; i++ {
-		offsets = append(offsets, arena.Alloc(64)) // Note: actually fits class 1 (128 bytes) due to 8-byte header
+		offsets = append(offsets, arena.Alloc(64)) // Note: actually fits class 1 (128 bytes) due to 16-byte header
 	}
 
-	bumpOff := atomic.LoadUint32(&arena.meta.bumpOffset)
+	bumpOff := atomic.LoadUint64(&arena.meta.bumpOffset)
 
 	for _, off := range offsets {
 		arena.Free(off)
 	}
 
-	var reOffsets []uint32
+	var reOffsets []uint64
 	for i := 0; i < 10; i++ {
 		reOffsets = append(reOffsets, arena.Alloc(64))
 	}
 
-	if atomic.LoadUint32(&arena.meta.bumpOffset) != bumpOff {
-		t.Fatal("bump offset moved; arena failed to reuse lock-free size class lists")
+	if atomic.LoadUint64(&arena.meta.bumpOffset) != bumpOff {
+		t.Fatal("bump offset moved; arena failed to reuse size class lists")
 	}
 
 	// Verify we got the exact same offsets back
-	offMap := make(map[uint32]bool)
+	offMap := make(map[uint64]bool)
 	for _, off := range offsets {
 		offMap[off] = true
 	}
@@ -144,12 +149,12 @@ func TestArena_EvacuationAndPurge(t *testing.T) {
 	}
 	defer arena.Close()
 
-	// RegionSize is 2MB. We need to allocate roughly 1.5MB to stay in the same region, 
+	// RegionSize is 2MB. We need to allocate roughly 1.5MB to stay in the same region,
 	// then drop the live bytes below the 40% RelocationWatermark.
-	allocSize := uint32(1550) // Pushed to 1600 bytes internally due to headers + alignment
-	allocCount := (1500 * 1024) / 1600 
+	allocSize := uint64(1550) // Pushed to 1600 bytes internally due to headers + alignment
+	allocCount := (1500 * 1024) / 1600
 
-	var offsets []uint32
+	var offsets []uint64
 	for i := 0; i < allocCount; i++ {
 		offsets = append(offsets, arena.Alloc(allocSize))
 	}
@@ -171,8 +176,8 @@ func TestArena_EvacuationAndPurge(t *testing.T) {
 	// If purgeRegion crashes during madvise, the test suite will fail.
 }
 
-// TestArena_ConcurrentAllocFree blasts the arena with parallel access to verify 
-// atomics and lock-free lists don't corrupt under heavy contention.
+// TestArena_ConcurrentAllocFree blasts the arena with parallel access to verify
+// atomics and free lists don't corrupt under heavy contention.
 func TestArena_ConcurrentAllocFree(t *testing.T) {
 	arena, err := NewArena[int](MaxArenaSize, -1)
 	if err != nil {
@@ -188,15 +193,15 @@ func TestArena_ConcurrentAllocFree(t *testing.T) {
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
-			var localOffsets []uint32
-			
+			var localOffsets []uint64
+
 			// Allocation phase
 			for j := 0; j < allocsPerWorker; j++ {
 				// Mix between size classes and direct large-alloc chunks
-				sz := uint32(rand.Intn(2048) + 16)
+				sz := uint64(rand.Intn(2048) + 16)
 				localOffsets = append(localOffsets, arena.Alloc(sz))
 			}
-			
+
 			// Reclaim phase
 			for _, off := range localOffsets {
 				arena.Free(off)
@@ -235,7 +240,7 @@ func TestArena_ZeroSize(t *testing.T) {
 	if off := arena.Alloc(0); off != 0 {
 		t.Fatalf("Alloc(0) returned %d, expected 0", off)
 	}
-	
+
 	// Free(0) should safely return without panicking or altering state
 	arena.Free(0)
 }
@@ -248,18 +253,18 @@ func TestArena_AllocBatch(t *testing.T) {
 	}
 	defer arena.Close()
 
-	batchSize := uint32(64)
+	batchSize := uint64(64)
 	count := int32(10)
 	off := arena.AllocBatch(batchSize, count)
 
-	hdr := (*BlockHeader)(arena.GetPtr(off - 8))
-	expectedSize := ((batchSize + 7) &^ 7) + 8
+	hdr := (*BlockHeader)(arena.GetPtr(off - blockHeaderSize64))
+	expectedSize := ((batchSize + 7) &^ 7) + blockHeaderSize64
 	if hdr.Size != expectedSize {
 		t.Errorf("expected batch header size %d, got %d", expectedSize, hdr.Size)
 	}
 
 	regionIdx := off / RegionSize
-	active := arena.meta.regions[regionIdx].activeCount.Load()
+	active := arena.regions[regionIdx].activeCount.Load()
 	if active != count {
 		t.Errorf("expected active count %d, got %d", count, active)
 	}
@@ -295,15 +300,15 @@ func TestArena_PurgeRegionZero(t *testing.T) {
 	// Manually trigger a purge on region 0
 	arena.purgeRegion(0)
 
-	// If metadata was unmapped via madvise, accessing bumpOffset would likely fault 
+	// If metadata was unmapped via madvise, accessing bumpOffset would likely fault
 	// or return 0 on the next read depending on OS behavior.
-	bump := atomic.LoadUint32(&arena.meta.bumpOffset)
+	bump := atomic.LoadUint64(&arena.meta.bumpOffset)
 	if bump == 0 {
 		t.Fatal("FATAL: metadata corrupted or zeroed after purgeRegion(0)")
 	}
 }
 
-// TestArena_PopBatchSkipsEvacuated verifies lock-free lists are ignored if a region is evacuating.
+// TestArena_PopBatchSkipsEvacuated verifies free lists are ignored if a region is evacuating.
 func TestArena_PopBatchSkipsEvacuated(t *testing.T) {
 	arena, err := NewArena[int](MaxArenaSize, -1)
 	if err != nil {
@@ -316,9 +321,9 @@ func TestArena_PopBatchSkipsEvacuated(t *testing.T) {
 
 	// Force the evacuation flag to mimic a compaction event
 	regionIdx := off / RegionSize
-	arena.meta.regions[regionIdx].evacuate.Store(1)
+	arena.regions[regionIdx].evacuate.Store(1)
 
-	classIdx, _ := GetSizeClass(64 + 8) 
+	classIdx, _ := GetSizeClass(64 + 16)
 	head, _, count := arena.PopBatch(classIdx, 1)
 
 	if count != 0 || head != 0 {
@@ -332,7 +337,7 @@ func TestArena_CloseIdempotency(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to init arena: %v", err)
 	}
-	
+
 	if err := arena.Close(); err != nil {
 		t.Fatalf("first Close failed: %v", err)
 	}
@@ -355,7 +360,7 @@ func BenchmarkArena_Alloc_Sequential(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	
+
 	// Reset loop to prevent hitting memory limits during prolonged `-benchtime`
 	for b.Loop() {
 		off := arena.Alloc(128)
@@ -363,7 +368,7 @@ func BenchmarkArena_Alloc_Sequential(b *testing.B) {
 	}
 }
 
-// BenchmarkArena_AllocFree_Parallel hammers the free-list PopBatch/Push logic to 
+// BenchmarkArena_AllocFree_Parallel hammers the free-list PopBatch/Push logic to
 // observe contention scaling on size classes.
 func BenchmarkArena_AllocFree_Parallel(b *testing.B) {
 	arena, err := NewArena[int](MaxArenaSize, -1)
@@ -411,7 +416,7 @@ func BenchmarkArena_AllocBatch(b *testing.B) {
 	defer arena.Close()
 
 	// Represent a realistic TLAB chunk: 16 items of 64 bytes each
-	chunkSize := uint32(64 * 16)
+	chunkSize := uint64(64 * 16)
 	items := int32(16)
 
 	b.ResetTimer()
@@ -432,7 +437,7 @@ func BenchmarkArena_GetPtr(b *testing.B) {
 		b.Fatalf("failed to init arena: %v", err)
 	}
 	defer arena.Close()
-	
+
 	off := arena.Alloc(64)
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -452,39 +457,42 @@ func reviewArena(t *testing.T) *Arena {
 	return a
 }
 
-func TestReviewReuseRestoresRegionAccounting(t *testing.T) {
+func TestReview64ReuseRestoresRegionAccounting(t *testing.T) {
 	a := reviewArena(t)
 	p := a.AllocDense(120)
 	_ = a.AllocDense(120)
-	r := &a.meta.regions[(p-8)/RegionSize]
+	r := &a.regions[(p-blockHeaderSize64)/RegionSize]
 	a.Free(p)
 	q := a.Alloc(120)
 	if q != p {
 		t.Fatalf("setup: got different block %d instead of %d", q, p)
 	}
-	if c, b := r.activeCount.Load(), r.liveBytes.Load(); c != 2 || b != 256 {
-		t.Fatalf("after reuse: activeCount=%d liveBytes=%d; want 2 and 256", c, b)
+	if c, b := r.activeCount.Load(), r.liveBytes.Load(); c != 2 || b != 544 {
+		t.Fatalf("after reuse: activeCount=%d liveBytes=%d; want 2 and 544", c, b)
 	}
 }
 
-func TestReviewDenseBlockIsLargeEnoughWhenReused(t *testing.T) {
+func TestReview64DenseBlockIsLargeEnoughWhenReused(t *testing.T) {
 	a := reviewArena(t)
-	p := a.AllocDense(64) // 72-byte block
-	_ = a.AllocDense(120)
+	p := a.AllocDense(64) // 80-byte block before size-class rounding
+	_ = a.AllocDense(112)
 	a.Free(p)
-	q := a.Alloc(120)
-	h := (*BlockHeader)(a.GetPtr(q - 8))
-	if h.Size < 128 {
-		t.Fatalf("120-byte request got only %d payload bytes at %d", h.Size-8, q)
+	q := a.Alloc(112)
+	if q != p {
+		t.Fatalf("setup: block was not reused; got %d instead of %d", q, p)
+	}
+	h := (*BlockHeader)(a.GetPtr(q - blockHeaderSize64))
+	if h.Size < 112+blockHeaderSize64 {
+		t.Fatalf("112-byte request got only %d payload bytes at %d", h.Size-blockHeaderSize64, q)
 	}
 }
 
-func TestReviewReuseDoesNotPurgeLiveMemory(t *testing.T) {
+func TestReview64ReuseDoesNotPurgeLiveMemory(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("checks Linux anonymous MADV_DONTNEED behavior")
 	}
 	a := reviewArena(t)
-	_ = a.AllocDense(RegionSize - 8)
+	_ = a.AllocDense(RegionSize - blockHeaderSize64)
 	p := a.AllocDense(120)
 	guard := a.AllocDense(120)
 	a.Free(p)
@@ -500,28 +508,28 @@ func TestReviewReuseDoesNotPurgeLiveMemory(t *testing.T) {
 	}
 }
 
-func TestReviewAllocationSizeDoesNotWrap(t *testing.T) {
+func TestReview64AllocationSizeDoesNotWrap(t *testing.T) {
 	a := reviewArena(t)
 	defer func() {
 		if recover() == nil {
-			t.Error("Alloc(MaxUint32) returned instead of rejecting impossible size")
+			t.Error("Alloc(MaxUint64) returned instead of rejecting impossible size")
 		}
 	}()
-	a.Alloc(^uint32(0))
+	a.Alloc(^uint64(0))
 }
 
-func TestReviewTLABLiveBytesAreAccountedBeforeFree(t *testing.T) {
+func TestReview64TLABLiveBytesAreAccountedBeforeFree(t *testing.T) {
 	a := reviewArena(t)
 	p := a.Alloc(64)
-	r := &a.meta.regions[(p-8)/RegionSize]
+	r := &a.regions[(p-blockHeaderSize64)/RegionSize]
 	a.Free(p)
 	if b := r.liveBytes.Load(); b < 0 {
 		t.Fatalf("negative liveBytes after one alloc/free: %d", b)
 	}
 }
 
-func TestReviewArenaRejectsTooSmallMapping(t *testing.T) {
-	a, err := NewArena[uint64](uint32(unsafe.Sizeof(uint32(0))), -1)
+func TestReview64ArenaRejectsTooSmallMapping(t *testing.T) {
+	a, err := NewArena[uint64](uint64(unsafe.Sizeof(uint64(0))), -1)
 	if err == nil {
 		_ = a.Close()
 		t.Fatal("mapping too small for arena metadata was accepted")
