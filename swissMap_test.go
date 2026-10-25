@@ -760,3 +760,89 @@ func BenchmarkStdMap_Range_HighlyFragmented(b *testing.B) {
 		_ = sum
 	}
 }
+
+// This crosses the old 2 MiB single-block limit during ordinary Put growth.
+func TestSwissMap_GrowsAcrossRegions(t *testing.T) {
+	a, err := NewArena[int](64<<20, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	m := NewSwissMap[int, int](a, 8, FastHasherInt)
+	const entries = 80000 // Forces capacity 131072 for int/int slots.
+	for i := 0; i < entries; i++ {
+		m.Put(i, i*3)
+	}
+	if m.capacity < 131072 || len(m.table.slotChunks) < 2 {
+		t.Fatalf("table did not split: capacity=%d, chunks=%d", m.capacity, len(m.table.slotChunks))
+	}
+	for i := 0; i < entries; i++ {
+		if got, ok := m.Get(i); !ok || got != i*3 {
+			t.Fatalf("Get(%d) = (%d, %v)", i, got, ok)
+		}
+	}
+	for i := 0; i < entries; i += 2 {
+		m.Delete(i)
+	}
+	m.rehash(m.capacity) // Compact a segmented table with live entries.
+	for i := 0; i < entries; i++ {
+		got, ok := m.Get(i)
+		if ok != (i%2 != 0) || (ok && got != i*3) {
+			t.Fatalf("after compaction Get(%d) = (%d, %v)", i, got, ok)
+		}
+	}
+	m.Close()
+	if m.capacity != 0 || len(m.table.ctrlOffsets) != 0 || len(m.table.slotOffsets) != 0 {
+		t.Fatal("Close retained segmented table allocations")
+	}
+}
+
+// A control group can straddle a chunk boundary or the end of the table.
+func TestSwissMap_ControlChunkMirrors(t *testing.T) {
+	a, err := NewArena[uint32](128<<20, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+
+	const cap = 2 * ctrlChunkSize
+	hasher := func(k uint32) uint64 { return uint64(k)<<7 | 0x35 }
+	m := NewSwissMap[uint32, uint32](a, cap, hasher)
+	defer m.Close()
+	if len(m.table.ctrlChunks) != 2 {
+		t.Fatalf("control chunk count = %d; want 2", len(m.table.ctrlChunks))
+	}
+	keys := []uint32{0, 1, ctrlChunkSize - 2, ctrlChunkSize - 1,
+		ctrlChunkSize, ctrlChunkSize + 1, cap - 2, cap - 1}
+	for _, k := range keys {
+		m.Put(k, ^k)
+	}
+	if m.table.ctrlChunks[0][ctrlChunkSize] != 0x35 ||
+		m.table.ctrlChunks[1][ctrlChunkSize] != 0x35 {
+		t.Fatal("control byte was not mirrored across a chunk boundary")
+	}
+	for _, k := range keys {
+		if got, ok := m.Get(k); !ok || got != ^k {
+			t.Fatalf("Get(%d) = (%d, %v)", k, got, ok)
+		}
+	}
+	m.Delete(0)
+	m.Delete(ctrlChunkSize)
+	if m.table.ctrlChunks[0][ctrlChunkSize] != ctrlDeleted64 ||
+		m.table.ctrlChunks[1][ctrlChunkSize] != ctrlDeleted64 {
+		t.Fatal("deleted control byte was not mirrored")
+	}
+	m.rehash(m.capacity)
+	seen := 0
+	m.Range(func(k, v uint32) bool {
+		if v != ^k || k == 0 || k == ctrlChunkSize {
+			t.Fatalf("Range returned (%d, %d)", k, v)
+		}
+		seen++
+		return true
+	})
+	if seen != len(keys)-2 {
+		t.Fatalf("Range returned %d entries; want %d", seen, len(keys)-2)
+	}
+}
