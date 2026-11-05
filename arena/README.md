@@ -10,7 +10,7 @@ There is no interface dispatch or wrapper per allocation.
 | Full-block classes | Original 9, up to 8192 bytes | 18, including 8256, 16448 and full regions |
 | Sparse live regions | Evacuation hint; free lists excluded | Remain available for class reuse |
 | Empty regions | Reused; automatic page release | Reused; page release through `Trim` |
-| Region search | Original reverse scan, preserving the small fast path | Availability bitmap with direct newest-region lookup |
+| Region search | Tight reverse scan; bitmap after 256 initialized regions | Availability bitmap with direct newest-region lookup |
 | Size classifier | `utils.GetSizeClass` retains original contract | `arena.GetSizeClass` / `utils.GetExtendedSizeClass` |
 | Diagnostics | `Stats`, `Trim`, `PayloadCapacity`, `CheckedPtr` | Same methods |
 
@@ -34,7 +34,10 @@ proves liveness or the provenance of forged offsets. Close requires quiescence.
 `AllocBatch` is one exact block with explicit claims; return excess claims with
 `AddActiveCount` before its final Free. `AllocChunk` returns raw space for
 caller-written headers; blocks must cover its charged bytes and claims exactly.
-Empty regions reset their cursor and can serve allocations beyond the cumulative
+Default arenas build their class index once they initialize more than 256 regions
+(roughly 512 MiB of region space). Index publication is synchronized with concurrent
+Free and PopBatch, and file reopening rebuilds it from the owned free chains.
+Small default arenas keep their tight scan. Empty regions reset their cursor and can serve allocations beyond the cumulative
 size of the mapping. Exact holes in partially live regions are not coalesced.
 
 Idle TLAB reservations are recoverable even after sync.Pool drops its entries:

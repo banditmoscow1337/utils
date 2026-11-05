@@ -15,21 +15,21 @@ import (
 )
 
 const (
-	RegionSize          = 2 * 1024 * 1024
-	TLABChunkSize       = 64 * 1024
-	SizeClassCount      = 18
-	MaxArenaSize        = 1<<32 - 1
-	MaxRegions          = (MaxArenaSize + RegionSize - 1) / RegionSize
-	NumTLABs            = 128
-	RelocationWatermark = 0.40
-	HeaderSize          = uint64(unsafe.Sizeof(BlockHeader{}))
-	arenaMagic          = uint64(0x6164706172650001) // existing adaptive non-moving layout
-	compactArenaMagic   = uint64(0x6172656e61363402) // utils layout, version 2
-	regionReusable      = uint32(1)
-	regionPurged        = uint32(2)
-	modeNonMoving = uint32(1)
-	modeIndexTracking = uint32(2)
-	modeIndexReady = uint32(4)
+	RegionSize             = 2 * 1024 * 1024
+	TLABChunkSize          = 64 * 1024
+	SizeClassCount         = 18
+	MaxArenaSize           = 1<<32 - 1
+	MaxRegions             = (MaxArenaSize + RegionSize - 1) / RegionSize
+	NumTLABs               = 128
+	RelocationWatermark    = 0.40
+	HeaderSize             = uint64(unsafe.Sizeof(BlockHeader{}))
+	arenaMagic             = uint64(0x6164706172650001) // existing adaptive non-moving layout
+	compactArenaMagic      = uint64(0x6172656e61363402) // utils layout, version 2
+	regionReusable         = uint32(1)
+	regionPurged           = uint32(2)
+	modeNonMoving          = uint32(1)
+	modeIndexTracking      = uint32(2)
+	modeIndexReady         = uint32(4)
 	indexedRegionThreshold = uint64(256)
 )
 
@@ -411,7 +411,7 @@ func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint64, count 
 	return 0, 0, 0
 }
 
-// PopBatch returns an owned chain from one region, with the last NextFree == 0.
+// popIndexedBatch returns an owned chain from one region, with the last NextFree == 0.
 // An availability bitmap avoids walking every region on each allocation miss.
 func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 	if class < 0 || class >= SizeClassCount || max <= 0 {
@@ -427,7 +427,7 @@ func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 	first := true
 	for {
 		r := &a.regions[idx]
-		// Resolve the newest region directly; NonMoving misses use the bitmap.
+		// Resolve the newest region directly; misses use the bitmap.
 		if (!first || atomic.LoadUint64(&r.freeHeads[class]) != 0) && r.evacuate.Load() == 0 {
 			r.enter()
 			if r.evacuate.Load() == 0 {
@@ -511,21 +511,29 @@ func (a *Arena) Free(offset uint64) {
 // retains the old scan until the initial index is complete, so no free block
 // can be missed during the transition. Bits remain conservative after a pop.
 func (a *Arena) enableIndexLocked() {
-    if a.mode.Load()&modeIndexReady != 0 { return }
-    words := int((a.meta.nextRegion+63)/64)
-    for class:=0;class<SizeClassCount;class++ {
-        for w:=0;w<words;w++ { atomic.StoreUint64(&a.freeMasks[class*a.maskWords+w],0) }
-    }
-    a.mode.Or(modeIndexTracking)
-    for idx:=a.dataStart/RegionSize;idx<a.meta.nextRegion;idx++ {
-        r:=&a.regions[idx]
-        for class:=range r.freeHeads {
-            head:=lockHead64(&r.freeHeads[class])
-            if head!=0 { a.setAvailable(class,idx) } else { a.clearAvailable(class,idx) }
-            unlockHead64(&r.freeHeads[class],head)
-        }
-    }
-    a.mode.Or(modeIndexReady)
+	if a.mode.Load()&modeIndexReady != 0 {
+		return
+	}
+	words := int((a.meta.nextRegion + 63) / 64)
+	for class := 0; class < SizeClassCount; class++ {
+		for w := 0; w < words; w++ {
+			atomic.StoreUint64(&a.freeMasks[class*a.maskWords+w], 0)
+		}
+	}
+	a.mode.Or(modeIndexTracking)
+	for idx := a.dataStart / RegionSize; idx < a.meta.nextRegion; idx++ {
+		r := &a.regions[idx]
+		for class := range r.freeHeads {
+			head := lockHead64(&r.freeHeads[class])
+			if head != 0 {
+				a.setAvailable(class, idx)
+			} else {
+				a.clearAvailable(class, idx)
+			}
+			unlockHead64(&r.freeHeads[class], head)
+		}
+	}
+	a.mode.Or(modeIndexReady)
 }
 
 func (a *Arena) setAvailable(class int, idx uint64) {
