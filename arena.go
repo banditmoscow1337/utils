@@ -47,6 +47,7 @@ type ArenaOptions struct{ NonMoving bool }
 // mappings of the same file and crash recovery are deliberately unsupported.
 type Arena struct {
 	nonMoving    bool
+	watermark    int32
 	basePtr      unsafe.Pointer
 	size         uint64
 	dataStart    uint64
@@ -146,7 +147,11 @@ func NewArenaWithOptions(size uint64, fd int, options ArenaOptions) (*Arena, err
 	if err != nil {
 		return nil, err
 	}
-	a := &Arena{nonMoving: options.NonMoving, basePtr: unsafe.Pointer(&b[0]), size: size, dataStart: dataStart, maskWords: int(words)}
+	threshold := int32(0)
+	if !options.NonMoving {
+		threshold = (RegionSize*2 + 4) / 5 // ceil(40%); zero disables hints
+	}
+	a := &Arena{nonMoving: options.NonMoving, watermark: threshold, basePtr: unsafe.Pointer(&b[0]), size: size, dataStart: dataStart, maskWords: int(words)}
 	a.meta = (*arenaMeta)(a.basePtr)
 	a.regions = unsafe.Slice((*Region)(unsafe.Add(a.basePtr, unsafe.Sizeof(arenaMeta{}))), int(count))
 	a.freeMasks = unsafe.Slice((*uint64)(unsafe.Add(a.basePtr, masksStart)), int(words)*SizeClassCount)
@@ -342,9 +347,63 @@ func (a *Arena) AddActiveCount(offset uint64, delta int32) {
 	}
 }
 
+// PopBatch keeps the original tight default scan. NonMoving uses the mmap
+// availability index; both paths share ownership, head locks and reclamation.
+func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint64, count int) {
+	if classIdx < 0 || classIdx >= SizeClassCount || max <= 0 {
+		return 0, 0, 0
+	}
+	if a.nonMoving {
+		return a.popIndexedBatch(classIdx, max)
+	}
+	startRegion := atomic.LoadUint64(&a.meta.bumpOffset) / RegionSize
+	if startRegion >= uint64(len(a.regions)) {
+		startRegion = uint64(len(a.regions) - 1)
+	}
+	for r := int(startRegion); r >= 0; r-- {
+		region := &a.regions[r]
+		headAddr := &region.freeHeads[classIdx]
+		if region.evacuate.Load() == 1 || atomic.LoadUint64(headAddr) == 0 {
+			continue
+		}
+		// Keep the region leased until the removed blocks regain their claims.
+		region.enter()
+		if region.evacuate.Load() == 1 {
+			a.leaveRegion(uint64(r))
+			continue
+		}
+		head := lockHead64(headAddr)
+		if head == 0 {
+			unlockHead64(headAddr, 0)
+			a.leaveRegion(uint64(r))
+			continue
+		}
+		last := head
+		hdr := (*BlockHeader)(a.GetPtr(last - blockHeaderSize64))
+		next := hdr.NextFree
+		bytes := int32(hdr.Size)
+		count = 1
+		for count < max && next != 0 {
+			last = next
+			hdr = (*BlockHeader)(a.GetPtr(last - blockHeaderSize64))
+			next = hdr.NextFree
+			bytes += int32(hdr.Size)
+			count++
+		}
+		region.activeCount.Add(int32(count))
+		region.liveBytes.Add(bytes)
+		hdr.NextFree = 0
+		unlockHead64(headAddr, next)
+		a.leaveRegion(uint64(r))
+		return head, last, count
+	}
+	return 0, 0, 0
+}
+
+
 // PopBatch returns an owned chain from one region, with the last NextFree == 0.
 // An availability bitmap avoids walking every region on each allocation miss.
-func (a *Arena) PopBatch(class, max int) (head, tail uint64, count int) {
+func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 	if class < 0 || class >= SizeClassCount || max <= 0 {
 		return
 	}
@@ -421,12 +480,10 @@ func (a *Arena) Free(offset uint64) {
 	r := &a.regions[idx]
 	size := h.Size
 	live := r.liveBytes.Add(-int32(size))
-	if !a.nonMoving {
-		start := idx * RegionSize
-		cursor := atomic.LoadUint64(&r.cursor)
-		if cursor > start+(RegionSize*2)/5 && live > 0 && float64(live)/RegionSize < RelocationWatermark {
-			r.evacuate.Store(1)
-		}
+	start := idx * RegionSize
+	cursor := atomic.LoadUint64(&r.cursor)
+	if cursor > start+(RegionSize*2)/5 && live > 0 && live < a.watermark {
+		r.evacuate.Store(1)
 	}
 	class, rounded := GetSizeClass(size)
 	if class < 0 && a.nonMoving {
