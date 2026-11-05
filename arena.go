@@ -27,6 +27,10 @@ const (
 	compactArenaMagic   = uint64(0x6172656e61363402) // utils layout, version 2
 	regionReusable      = uint32(1)
 	regionPurged        = uint32(2)
+	modeNonMoving = uint32(1)
+	modeIndexTracking = uint32(2)
+	modeIndexReady = uint32(4)
+	indexedRegionThreshold = uint64(256)
 )
 
 // Sizes include the 16-byte block header. The 8256 and 16448 classes hold
@@ -46,7 +50,7 @@ type ArenaOptions struct{ NonMoving bool }
 // Close and opening an existing mapping require exclusive ownership. Concurrent
 // mappings of the same file and crash recovery are deliberately unsupported.
 type Arena struct {
-	nonMoving    bool
+	mode         atomic.Uint32
 	watermark    int32
 	basePtr      unsafe.Pointer
 	size         uint64
@@ -151,7 +155,10 @@ func NewArenaWithOptions(size uint64, fd int, options ArenaOptions) (*Arena, err
 	if !options.NonMoving {
 		threshold = (RegionSize*2 + 4) / 5 // ceil(40%); zero disables hints
 	}
-	a := &Arena{nonMoving: options.NonMoving, watermark: threshold, basePtr: unsafe.Pointer(&b[0]), size: size, dataStart: dataStart, maskWords: int(words)}
+	a := &Arena{watermark: threshold, basePtr: unsafe.Pointer(&b[0]), size: size, dataStart: dataStart, maskWords: int(words)}
+	if options.NonMoving {
+		a.mode.Store(modeNonMoving)
+	}
 	a.meta = (*arenaMeta)(a.basePtr)
 	a.regions = unsafe.Slice((*Region)(unsafe.Add(a.basePtr, unsafe.Sizeof(arenaMeta{}))), int(count))
 	a.freeMasks = unsafe.Slice((*uint64)(unsafe.Add(a.basePtr, masksStart)), int(words)*SizeClassCount)
@@ -179,6 +186,9 @@ func NewArenaWithOptions(size uint64, fd int, options ArenaOptions) (*Arena, err
 		a.meta.currentRegion > count || a.meta.reusableHead > count {
 		_ = unix.Munmap(b)
 		return nil, errors.New("arena: incompatible or invalid mapping metadata")
+	}
+	if options.NonMoving || a.meta.nextRegion > indexedRegionThreshold {
+		a.enableIndexLocked()
 	}
 	return a, nil
 }
@@ -244,7 +254,7 @@ func (a *Arena) Alloc(size uint64) uint64 {
 		return 0
 	}
 	class, total := GetSizeClass(blockSize(size))
-	if class < 0 && a.nonMoving {
+	if class < 0 && a.mode.Load()&modeNonMoving != 0 {
 		class, total = largeSizeClass(total)
 	}
 	if head, _, n := a.PopBatch(class, 1); n != 0 {
@@ -294,7 +304,7 @@ func (a *Arena) AllocDense(size uint64) uint64 {
 		return 0
 	}
 	class, total := GetSizeClass(blockSize(size))
-	if class < 0 && a.nonMoving {
+	if class < 0 && a.mode.Load()&modeNonMoving != 0 {
 		class, total = largeSizeClass(total)
 	}
 	if head, _, n := a.PopBatch(class, 1); n != 0 {
@@ -347,13 +357,14 @@ func (a *Arena) AddActiveCount(offset uint64, delta int32) {
 	}
 }
 
-// PopBatch keeps the original tight default scan. NonMoving uses the mmap
-// availability index; both paths share ownership, head locks and reclamation.
+// PopBatch keeps the original tight scan for small default arenas. NonMoving
+// and large default arenas use an availability index with the same ownership,
+// head locks and reclamation.
 func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint64, count int) {
 	if classIdx < 0 || classIdx >= SizeClassCount || max <= 0 {
 		return 0, 0, 0
 	}
-	if a.nonMoving {
+	if a.mode.Load()&modeIndexReady != 0 {
 		return a.popIndexedBatch(classIdx, max)
 	}
 	startRegion := atomic.LoadUint64(&a.meta.bumpOffset) / RegionSize
@@ -400,7 +411,6 @@ func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint64, count 
 	return 0, 0, 0
 }
 
-
 // PopBatch returns an owned chain from one region, with the last NextFree == 0.
 // An availability bitmap avoids walking every region on each allocation miss.
 func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
@@ -441,19 +451,12 @@ func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 					a.leaveRegion(idx)
 					return
 				}
-				if a.nonMoving {
+				if a.mode.Load()&modeIndexTracking != 0 {
 					a.clearAvailable(class, idx)
 				}
 				unlockHead64(&r.freeHeads[class], 0)
 			}
 			a.leaveRegion(idx)
-		}
-		if !a.nonMoving {
-			if idx == 0 {
-				return 0, 0, 0
-			}
-			idx--
-			continue
 		}
 		first = false
 		for mask == 0 {
@@ -486,13 +489,13 @@ func (a *Arena) Free(offset uint64) {
 		r.evacuate.Store(1)
 	}
 	class, rounded := GetSizeClass(size)
-	if class < 0 && a.nonMoving {
+	if class < 0 && a.mode.Load()&modeNonMoving != 0 {
 		class, rounded = largeSizeClass(rounded)
 	}
 	if class != -1 && rounded == size && r.evacuate.Load() == 0 {
 		head := lockHead64(&r.freeHeads[class])
 		h.NextFree = head
-		if a.nonMoving {
+		if a.mode.Load()&modeIndexTracking != 0 {
 			a.setAvailable(class, idx)
 		}
 		unlockHead64(&r.freeHeads[class], offset)
@@ -501,6 +504,28 @@ func (a *Arena) Free(offset uint64) {
 	if r.activeCount.Add(-1) == 0 {
 		a.recycleRegion(idx)
 	}
+}
+
+// enableIndexLocked runs under reserveMu, or during exclusive construction.
+// Free starts indexing under its head lock before the initial scan. PopBatch
+// retains the old scan until the initial index is complete, so no free block
+// can be missed during the transition. Bits remain conservative after a pop.
+func (a *Arena) enableIndexLocked() {
+    if a.mode.Load()&modeIndexReady != 0 { return }
+    words := int((a.meta.nextRegion+63)/64)
+    for class:=0;class<SizeClassCount;class++ {
+        for w:=0;w<words;w++ { atomic.StoreUint64(&a.freeMasks[class*a.maskWords+w],0) }
+    }
+    a.mode.Or(modeIndexTracking)
+    for idx:=a.dataStart/RegionSize;idx<a.meta.nextRegion;idx++ {
+        r:=&a.regions[idx]
+        for class:=range r.freeHeads {
+            head:=lockHead64(&r.freeHeads[class])
+            if head!=0 { a.setAvailable(class,idx) } else { a.clearAvailable(class,idx) }
+            unlockHead64(&r.freeHeads[class],head)
+        }
+    }
+    a.mode.Or(modeIndexReady)
 }
 
 func (a *Arena) setAvailable(class int, idx uint64) {
@@ -591,6 +616,9 @@ func (a *Arena) tryReserve(size uint64, count int32) uint64 {
 		a.meta.nextRegion++
 		r := &a.regions[idx]
 		atomic.StoreUint64(&r.cursor, a.regionStart(idx))
+		if a.meta.nextRegion > indexedRegionThreshold && a.mode.Load()&modeIndexReady == 0 {
+			a.enableIndexLocked()
+		}
 		if a.regionEnd(idx)-r.cursor < size {
 			r.flags, r.nextFree = regionReusable, a.meta.reusableHead
 			a.meta.reusableHead = idx + 1
@@ -618,7 +646,7 @@ func (a *Arena) recycleRegion(idx uint64) {
 		if atomic.LoadUint64(&r.freeHeads[class]) != 0 {
 			atomic.StoreUint64(&r.freeHeads[class], 0)
 		}
-		if a.nonMoving {
+		if a.mode.Load()&modeIndexTracking != 0 {
 			a.clearAvailable(class, idx)
 		}
 	}
@@ -630,7 +658,7 @@ func (a *Arena) recycleRegion(idx uint64) {
 	}
 	r.flags, r.nextFree = regionReusable, a.meta.reusableHead
 	a.meta.reusableHead = idx + 1
-	if !a.nonMoving {
+	if a.mode.Load()&modeNonMoving == 0 {
 		_ = a.purgePages(idx, r)
 	}
 }
