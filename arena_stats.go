@@ -44,8 +44,11 @@ func (a *Arena) Stats() Stats {
 		free := uint64(0)
 		for class := range r.freeHeads {
 			head := lockHead64(&r.freeHeads[class])
-			n:=uint64(0)
-			for off:=head;off!=0; { n++;off=(*BlockHeader)(a.ptr(off-HeaderSize)).NextFree }
+			n := uint64(0)
+			for off := head; off != 0; {
+				n++
+				off = (*BlockHeader)(a.ptr(off - HeaderSize)).NextFree
+			}
 			s.FreeBlocksByClass[class] += n
 			free += n * sizeClasses[class]
 			unlockHead64(&r.freeHeads[class], head)

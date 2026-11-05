@@ -566,5 +566,9 @@ func TestConcurrentAllocFreeTrimAndStats(t *testing.T) {
 	assertEmpty(t, a)
 }
 
-func newStableArena(size uint64) (*Arena,error) { return NewArenaWithOptions(size,-1,ArenaOptions{NonMoving:true}) }
-func openStableArena(size uint64,fd int) (*Arena,error) { return NewArenaWithOptions(size,fd,ArenaOptions{NonMoving:true}) }
+func newStableArena(size uint64) (*Arena, error) {
+	return NewArenaWithOptions(size, -1, ArenaOptions{NonMoving: true})
+}
+func openStableArena(size uint64, fd int) (*Arena, error) {
+	return NewArenaWithOptions(size, fd, ArenaOptions{NonMoving: true})
+}

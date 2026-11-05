@@ -21,14 +21,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.3'
-      - name: Format arena sources
-        run: |
-          gofmt -w arena.go arena_*.go arena
-          python3 - <<'PY'
-          import json,pathlib
-          paths=[pathlib.Path('arena.go'),*pathlib.Path('.').glob('arena_*.go'),*pathlib.Path('arena').glob('*.go')]
-          print('FORMATTED_FILES_JSON='+json.dumps({str(p):p.read_text() for p in paths},ensure_ascii=True))
-          PY
+      - name: Arena formatting
+        run: test -z "$(gofmt -l arena.go arena_*.go arena)"
       - name: Functional tests
         run: go test ./... -count=1 -timeout=180s
       - name: Race detector

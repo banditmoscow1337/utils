@@ -15,18 +15,18 @@ import (
 )
 
 const (
-	RegionSize     = 2 * 1024 * 1024
-	TLABChunkSize  = 64 * 1024
-	SizeClassCount = 18
-	MaxArenaSize = 1<<32 - 1
-	MaxRegions = (MaxArenaSize + RegionSize - 1) / RegionSize
-	NumTLABs = 128
+	RegionSize          = 2 * 1024 * 1024
+	TLABChunkSize       = 64 * 1024
+	SizeClassCount      = 18
+	MaxArenaSize        = 1<<32 - 1
+	MaxRegions          = (MaxArenaSize + RegionSize - 1) / RegionSize
+	NumTLABs            = 128
 	RelocationWatermark = 0.40
-	HeaderSize     = uint64(unsafe.Sizeof(BlockHeader{}))
-	arenaMagic     = uint64(0x6164706172650001) // existing adaptive non-moving layout
-	compactArenaMagic = uint64(0x6172656e61363402) // utils layout, version 2
-	regionReusable = uint32(1)
-	regionPurged   = uint32(2)
+	HeaderSize          = uint64(unsafe.Sizeof(BlockHeader{}))
+	arenaMagic          = uint64(0x6164706172650001) // existing adaptive non-moving layout
+	compactArenaMagic   = uint64(0x6172656e61363402) // utils layout, version 2
+	regionReusable      = uint32(1)
+	regionPurged        = uint32(2)
 )
 
 // Sizes include the 16-byte block header. The 8256 and 16448 classes hold
@@ -39,14 +39,14 @@ var sizeClasses = [SizeClassCount]uint64{
 // ArenaOptions selects reclamation policy on the shared allocator.
 // NonMoving disables evacuation hints and defers page release until Trim.
 // Its zero value preserves the original utils policy.
-type ArenaOptions struct { NonMoving bool }
+type ArenaOptions struct{ NonMoving bool }
 
 // Arena owns the mapping. Its small Go control objects stay GC-visible; payloads,
 // region metadata, free-list heads and availability bitmaps live in the mapping.
 // Close and opening an existing mapping require exclusive ownership. Concurrent
 // mappings of the same file and crash recovery are deliberately unsupported.
 type Arena struct {
-	nonMoving bool
+	nonMoving    bool
 	basePtr      unsafe.Pointer
 	size         uint64
 	dataStart    uint64
@@ -82,7 +82,7 @@ type Region struct {
 	users       atomic.Int32
 	evacuate    atomic.Uint32
 	freeHeads   [SizeClassCount]uint64
-	_ [SizeClassCount]uint32 // reserved: historical adaptive diagnostic counts
+	_           [SizeClassCount]uint32 // reserved: historical adaptive diagnostic counts
 	cursor      uint64
 	nextFree    uint64
 	flags       uint32
@@ -108,7 +108,9 @@ type localTLAB struct {
 
 // NewArena maps a fixed-size arena with evacuation hints and automatic page release.
 // The type parameter is retained for source compatibility.
-func NewArena[T any](size uint64, fd int) (*Arena,error) { return NewArenaWithOptions(size,fd,ArenaOptions{}) }
+func NewArena[T any](size uint64, fd int) (*Arena, error) {
+	return NewArenaWithOptions(size, fd, ArenaOptions{})
+}
 
 // NewArenaWithOptions maps size bytes; fd == -1 creates an anonymous mapping. A file must already
 // be at least size bytes and must be zero-filled or use this exact format. Files
@@ -116,7 +118,9 @@ func NewArena[T any](size uint64, fd int) (*Arena,error) { return NewArenaWithOp
 // callers are responsible for retaining their root offsets separately.
 func NewArenaWithOptions(size uint64, fd int, options ArenaOptions) (*Arena, error) {
 	magic := compactArenaMagic
-	if options.NonMoving { magic = arenaMagic }
+	if options.NonMoving {
+		magic = arenaMagic
+	}
 	if size > uint64(int(^uint(0)>>1)) {
 		return nil, errors.New("arena: mapping exceeds int")
 	}
@@ -142,18 +146,21 @@ func NewArenaWithOptions(size uint64, fd int, options ArenaOptions) (*Arena, err
 	if err != nil {
 		return nil, err
 	}
-	a := &Arena{nonMoving:options.NonMoving,basePtr: unsafe.Pointer(&b[0]), size: size, dataStart: dataStart, maskWords: int(words)}
+	a := &Arena{nonMoving: options.NonMoving, basePtr: unsafe.Pointer(&b[0]), size: size, dataStart: dataStart, maskWords: int(words)}
 	a.meta = (*arenaMeta)(a.basePtr)
 	a.regions = unsafe.Slice((*Region)(unsafe.Add(a.basePtr, unsafe.Sizeof(arenaMeta{}))), int(count))
 	a.freeMasks = unsafe.Slice((*uint64)(unsafe.Add(a.basePtr, masksStart)), int(words)*SizeClassCount)
 	if a.meta.magic == 0 && a.meta.mappingSize == 0 && a.meta.bumpOffset == 0 {
 		// Anonymous mappings are already zero-filled; preserve lazy metadata pages.
-        // A new backing file must have fully zeroed metadata.
-        if fd != -1 {
-            for _,v := range b[:dataStart] {
-                if v != 0 { _ = unix.Munmap(b); return nil, errors.New("arena: nonzero uninitialized metadata") }
-            }
-        }
+		// A new backing file must have fully zeroed metadata.
+		if fd != -1 {
+			for _, v := range b[:dataStart] {
+				if v != 0 {
+					_ = unix.Munmap(b)
+					return nil, errors.New("arena: nonzero uninitialized metadata")
+				}
+			}
+		}
 		a.meta.magic = magic
 		a.meta.mappingSize = size
 		a.meta.bumpOffset = dataStart
@@ -198,16 +205,24 @@ func GetSizeClass(size uint64) (int, uint64) {
 	}
 }
 
-func largeSizeClass(size uint64) (int,uint64) {
-    for i:=9;i<SizeClassCount;i++ { if size<=sizeClasses[i] { return i,sizeClasses[i] } }
-    return -1,size
+func largeSizeClass(size uint64) (int, uint64) {
+	for i := 9; i < SizeClassCount; i++ {
+		if size <= sizeClasses[i] {
+			return i, sizeClasses[i]
+		}
+	}
+	return -1, size
 }
-func GetExtendedSizeClass(size uint64) (int,uint64) {
-    class,total:=GetSizeClass(size)
-    if class<0 { return largeSizeClass(total) }
-    return class,total
+func GetExtendedSizeClass(size uint64) (int, uint64) {
+	class, total := GetSizeClass(size)
+	if class < 0 {
+		return largeSizeClass(total)
+	}
+	return class, total
 }
+
 const blockHeaderSize64 = HeaderSize
+
 func blockSize64(size uint64) uint64 { return blockSize(size) }
 
 func blockSize(size uint64) uint64 {
@@ -224,7 +239,9 @@ func (a *Arena) Alloc(size uint64) uint64 {
 		return 0
 	}
 	class, total := GetSizeClass(blockSize(size))
-	if class<0 && a.nonMoving { class,total=largeSizeClass(total) }
+	if class < 0 && a.nonMoving {
+		class, total = largeSizeClass(total)
+	}
 	if head, _, n := a.PopBatch(class, 1); n != 0 {
 		return head
 	}
@@ -233,7 +250,7 @@ func (a *Arena) Alloc(size uint64) uint64 {
 	}
 	t := a.acquireTLAB()
 	defer a.releaseTLAB(t)
-	if uint64(t.rem) < total || (t.offset!=0 && a.NeedsEvacuation(t.offset)) {
+	if uint64(t.rem) < total || (t.offset != 0 && a.NeedsEvacuation(t.offset)) {
 		a.refundTLAB(t)
 		off := a.tryReserve(TLABChunkSize, TLABChunkSize/64)
 		if off == 0 {
@@ -272,7 +289,9 @@ func (a *Arena) AllocDense(size uint64) uint64 {
 		return 0
 	}
 	class, total := GetSizeClass(blockSize(size))
-	if class<0 && a.nonMoving { class,total=largeSizeClass(total) }
+	if class < 0 && a.nonMoving {
+		class, total = largeSizeClass(total)
+	}
 	if head, _, n := a.PopBatch(class, 1); n != 0 {
 		return head
 	}
@@ -332,57 +351,63 @@ func (a *Arena) PopBatch(class, max int) (head, tail uint64, count int) {
 	// The bitmap is a conservative index: keep a bit set when a pop empties a
 	// list, and clear it on the next miss under the head lock. Hot alloc/free
 	// pairs then avoid two atomic bitmap writes and a global counter per pair.
-	highest := (atomic.LoadUint64(&a.meta.bumpOffset)-1)/RegionSize
-    words := int(highest/64)+1
-    idx := highest
-    w,mask := 0,uint64(0)
-    first := true
-    for {
-        r:=&a.regions[idx]
-        // Resolve the newest region directly; NonMoving misses use the bitmap.
-        if (!first || atomic.LoadUint64(&r.freeHeads[class])!=0) && r.evacuate.Load()==0 {
-            r.enter()
-            if r.evacuate.Load()==0 {
-                head=lockHead64(&r.freeHeads[class])
-                if head!=0 {
-                    tail=head
-                    h:=(*BlockHeader)(a.ptr(tail-HeaderSize))
-                    next,charged:=h.NextFree,int32(h.Size)
-                    count=1
-                    for count<max && next!=0 {
-                        tail=next
-                        h=(*BlockHeader)(a.ptr(tail-HeaderSize))
-                        next=h.NextFree
-                        charged+=int32(h.Size)
-                        count++
-                    }
-                    r.activeCount.Add(int32(count))
-                    r.liveBytes.Add(charged)
-                    h.NextFree=0
-                    unlockHead64(&r.freeHeads[class],next)
-                    a.leaveRegion(idx)
-                    return
-                }
-                if a.nonMoving { a.clearAvailable(class,idx) }
-                unlockHead64(&r.freeHeads[class],0)
-            }
-            a.leaveRegion(idx)
-        }
-        if !a.nonMoving {
-            if idx==0 { return 0,0,0 }
-            idx--
-            continue
-        }
-        first=false
-        for mask==0 {
-            if w==words { return 0,0,0 }
-            mask=atomic.LoadUint64(&a.freeMasks[class*a.maskWords+w])
-            w++
-        }
-        bit:=bits.TrailingZeros64(mask)
-        mask&=mask-1
-        idx=uint64((w-1)*64+bit)
-    }
+	highest := (atomic.LoadUint64(&a.meta.bumpOffset) - 1) / RegionSize
+	words := int(highest/64) + 1
+	idx := highest
+	w, mask := 0, uint64(0)
+	first := true
+	for {
+		r := &a.regions[idx]
+		// Resolve the newest region directly; NonMoving misses use the bitmap.
+		if (!first || atomic.LoadUint64(&r.freeHeads[class]) != 0) && r.evacuate.Load() == 0 {
+			r.enter()
+			if r.evacuate.Load() == 0 {
+				head = lockHead64(&r.freeHeads[class])
+				if head != 0 {
+					tail = head
+					h := (*BlockHeader)(a.ptr(tail - HeaderSize))
+					next, charged := h.NextFree, int32(h.Size)
+					count = 1
+					for count < max && next != 0 {
+						tail = next
+						h = (*BlockHeader)(a.ptr(tail - HeaderSize))
+						next = h.NextFree
+						charged += int32(h.Size)
+						count++
+					}
+					r.activeCount.Add(int32(count))
+					r.liveBytes.Add(charged)
+					h.NextFree = 0
+					unlockHead64(&r.freeHeads[class], next)
+					a.leaveRegion(idx)
+					return
+				}
+				if a.nonMoving {
+					a.clearAvailable(class, idx)
+				}
+				unlockHead64(&r.freeHeads[class], 0)
+			}
+			a.leaveRegion(idx)
+		}
+		if !a.nonMoving {
+			if idx == 0 {
+				return 0, 0, 0
+			}
+			idx--
+			continue
+		}
+		first = false
+		for mask == 0 {
+			if w == words {
+				return 0, 0, 0
+			}
+			mask = atomic.LoadUint64(&a.freeMasks[class*a.maskWords+w])
+			w++
+		}
+		bit := bits.TrailingZeros64(mask)
+		mask &= mask - 1
+		idx = uint64((w-1)*64 + bit)
+	}
 }
 
 // Free releases an owned block. No reader may retain its payload. An empty region
@@ -391,26 +416,30 @@ func (a *Arena) Free(offset uint64) {
 	if offset == 0 {
 		return
 	}
-	h:=(*BlockHeader)(a.ptr(offset-HeaderSize))
-    idx:=(offset-HeaderSize)/RegionSize
-    r:=&a.regions[idx]
-    size:=h.Size
-    live:=r.liveBytes.Add(-int32(size))
-    if !a.nonMoving {
-        start:=idx*RegionSize
-        cursor:=atomic.LoadUint64(&r.cursor)
-        if cursor>start+(RegionSize*2)/5 && live>0 && float64(live)/RegionSize<RelocationWatermark {
-            r.evacuate.Store(1)
-        }
-    }
-    class,rounded:=GetSizeClass(size)
-    if class<0 && a.nonMoving { class,rounded=largeSizeClass(rounded) }
-    if class!=-1 && rounded==size && r.evacuate.Load()==0 {
-        head:=lockHead64(&r.freeHeads[class])
-        h.NextFree=head
-        if a.nonMoving { a.setAvailable(class,idx) }
-        unlockHead64(&r.freeHeads[class],offset)
-    }
+	h := (*BlockHeader)(a.ptr(offset - HeaderSize))
+	idx := (offset - HeaderSize) / RegionSize
+	r := &a.regions[idx]
+	size := h.Size
+	live := r.liveBytes.Add(-int32(size))
+	if !a.nonMoving {
+		start := idx * RegionSize
+		cursor := atomic.LoadUint64(&r.cursor)
+		if cursor > start+(RegionSize*2)/5 && live > 0 && float64(live)/RegionSize < RelocationWatermark {
+			r.evacuate.Store(1)
+		}
+	}
+	class, rounded := GetSizeClass(size)
+	if class < 0 && a.nonMoving {
+		class, rounded = largeSizeClass(rounded)
+	}
+	if class != -1 && rounded == size && r.evacuate.Load() == 0 {
+		head := lockHead64(&r.freeHeads[class])
+		h.NextFree = head
+		if a.nonMoving {
+			a.setAvailable(class, idx)
+		}
+		unlockHead64(&r.freeHeads[class], offset)
+	}
 	// This block's claim protects its header until its free-list update is done.
 	if r.activeCount.Add(-1) == 0 {
 		a.recycleRegion(idx)
@@ -424,10 +453,12 @@ func (a *Arena) setAvailable(class int, idx uint64) {
 		atomic.OrUint64(addr, bit)
 	}
 }
-func (a *Arena) clearAvailable(class int,idx uint64) {
-    addr:=&a.freeMasks[class*a.maskWords+int(idx/64)]
-    bit:=uint64(1)<<(idx%64)
-    if atomic.LoadUint64(addr)&bit!=0 { atomic.AndUint64(addr,^bit) }
+func (a *Arena) clearAvailable(class int, idx uint64) {
+	addr := &a.freeMasks[class*a.maskWords+int(idx/64)]
+	bit := uint64(1) << (idx % 64)
+	if atomic.LoadUint64(addr)&bit != 0 {
+		atomic.AndUint64(addr, ^bit)
+	}
 }
 func (a *Arena) regionStart(idx uint64) uint64 { return max(idx*RegionSize, a.dataStart) }
 func (a *Arena) regionEnd(idx uint64) uint64   { return min((idx+1)*RegionSize, a.size) &^ uint64(7) }
@@ -462,7 +493,7 @@ func (a *Arena) tryReserve(size uint64, count int32) uint64 {
 			if r.cursor+size <= a.regionEnd(idx) {
 				r.enter()
 				off := r.cursor
-				atomic.StoreUint64(&r.cursor,r.cursor+size)
+				atomic.StoreUint64(&r.cursor, r.cursor+size)
 				r.activeCount.Add(count)
 				r.liveBytes.Add(int32(size))
 				if r.cursor > atomic.LoadUint64(&a.meta.bumpOffset) {
@@ -502,7 +533,7 @@ func (a *Arena) tryReserve(size uint64, count int32) uint64 {
 		idx := a.meta.nextRegion
 		a.meta.nextRegion++
 		r := &a.regions[idx]
-		atomic.StoreUint64(&r.cursor,a.regionStart(idx))
+		atomic.StoreUint64(&r.cursor, a.regionStart(idx))
 		if a.regionEnd(idx)-r.cursor < size {
 			r.flags, r.nextFree = regionReusable, a.meta.reusableHead
 			a.meta.reusableHead = idx + 1
@@ -527,36 +558,42 @@ func (a *Arena) recycleRegion(idx uint64) {
 		return
 	}
 	for class := range r.freeHeads {
-		if atomic.LoadUint64(&r.freeHeads[class])!=0 { atomic.StoreUint64(&r.freeHeads[class],0) }
-		if a.nonMoving { a.clearAvailable(class, idx) }
+		if atomic.LoadUint64(&r.freeHeads[class]) != 0 {
+			atomic.StoreUint64(&r.freeHeads[class], 0)
+		}
+		if a.nonMoving {
+			a.clearAvailable(class, idx)
+		}
 	}
 	r.liveBytes.Store(0)
 	r.evacuate.Store(0)
-	atomic.StoreUint64(&r.cursor,a.regionStart(idx))
+	atomic.StoreUint64(&r.cursor, a.regionStart(idx))
 	if a.meta.currentRegion == idx+1 {
 		a.meta.currentRegion = 0
 	}
 	r.flags, r.nextFree = regionReusable, a.meta.reusableHead
 	a.meta.reusableHead = idx + 1
-    if !a.nonMoving { _=a.purgePages(idx,r) }
+	if !a.nonMoving {
+		_ = a.purgePages(idx, r)
+	}
 }
 
 func (a *Arena) purgeRegion(idx uint64) { a.recycleRegion(idx) }
 
-func (a *Arena) purgePages(idx uint64,r *Region) error {
-    page:=uint64(unix.Getpagesize())
-    start:=(a.regionStart(idx)+page-1)&^(page-1)
-    end:=a.regionEnd(idx)&^(page-1)
-    if start<end {
-        a.purgeCalls.Add(1)
-        if err:=unix.Madvise(unsafe.Slice((*byte)(a.ptr(start)),int(end-start)),unix.MADV_DONTNEED);err!=nil {
-            a.purgeErrors.Add(1)
-            return err
-        }
-        a.purgedBytes.Add(end-start)
-    }
-    r.flags|=regionPurged
-    return nil
+func (a *Arena) purgePages(idx uint64, r *Region) error {
+	page := uint64(unix.Getpagesize())
+	start := (a.regionStart(idx) + page - 1) &^ (page - 1)
+	end := a.regionEnd(idx) &^ (page - 1)
+	if start < end {
+		a.purgeCalls.Add(1)
+		if err := unix.Madvise(unsafe.Slice((*byte)(a.ptr(start)), int(end-start)), unix.MADV_DONTNEED); err != nil {
+			a.purgeErrors.Add(1)
+			return err
+		}
+		a.purgedBytes.Add(end - start)
+	}
+	r.flags |= regionPurged
+	return nil
 }
 
 // Trim refunds idle TLAB reservations and releases full pages of empty regions.
@@ -571,22 +608,28 @@ func (a *Arena) Trim() error {
 		return errors.New("arena: closed")
 	}
 	var firstErr error
-	for ref:=a.meta.reusableHead;ref!=0; {
-        r:=&a.regions[ref-1]
-        idx:=ref-1
-        ref=r.nextFree
-        if r.flags&regionPurged!=0 || !r.users.CompareAndSwap(0,-1) { continue }
-        if err:=a.purgePages(idx,r);err!=nil && firstErr==nil { firstErr=err }
-        r.users.Store(0)
-    }
+	for ref := a.meta.reusableHead; ref != 0; {
+		r := &a.regions[ref-1]
+		idx := ref - 1
+		ref = r.nextFree
+		if r.flags&regionPurged != 0 || !r.users.CompareAndSwap(0, -1) {
+			continue
+		}
+		if err := a.purgePages(idx, r); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		r.users.Store(0)
+	}
 	return firstErr
 }
 
 // NeedsEvacuation is a relocation hint; the allocator never moves live objects.
 // NonMoving arenas never set this hint.
 func (a *Arena) NeedsEvacuation(offset uint64) bool {
-    if offset==0 { return false }
-    return a.regions[offset/RegionSize].evacuate.Load()!=0
+	if offset == 0 {
+		return false
+	}
+	return a.regions[offset/RegionSize].evacuate.Load() != 0
 }
 
 func lockHead64(addr *uint64) uint64 {
@@ -666,19 +709,27 @@ func (a *Arena) drainIdleTLABs() {
 }
 
 //go:nosplit
-func (a *Arena) BasePtr() unsafe.Pointer { return a.basePtr }
-func (a *Arena) ptr(offset uint64) unsafe.Pointer { return unsafe.Add(a.basePtr,uintptr(offset)) }
+func (a *Arena) BasePtr() unsafe.Pointer          { return a.basePtr }
+func (a *Arena) ptr(offset uint64) unsafe.Pointer { return unsafe.Add(a.basePtr, uintptr(offset)) }
+
 // GetPtr resolves an owned offset without bounds or provenance checks.
 // CheckedPtr validates mapping bounds; PayloadCapacity also validates its header.
 func (a *Arena) GetPtr(offset uint64) unsafe.Pointer {
-    if offset==0 { return nil }
-    return unsafe.Add(a.basePtr,uintptr(offset))
+	if offset == 0 {
+		return nil
+	}
+	return unsafe.Add(a.basePtr, uintptr(offset))
 }
 func (a *Arena) CheckedPtr(offset uint64) unsafe.Pointer {
-    if offset==0 { return nil }
-    if a.basePtr==nil || offset>=a.size { panic("arena: offset outside live mapping") }
-    return a.ptr(offset)
+	if offset == 0 {
+		return nil
+	}
+	if a.basePtr == nil || offset >= a.size {
+		panic("arena: offset outside live mapping")
+	}
+	return a.ptr(offset)
 }
+
 //go:nosplit
 func (a *Arena) GetOffset(ptr unsafe.Pointer) uint64 {
 	if ptr == nil {
