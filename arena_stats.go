@@ -43,7 +43,7 @@ func (a *Arena) Stats() Stats {
 		s.ActiveClaims += int64(r.activeCount.Load())
 		free := uint64(0)
 		for class := range r.freeHeads {
-			head := lockHead64(&r.freeHeads[class])
+			head := lockHead64(&r.freeHeads[freeHeadIndex(class)])
 			n := uint64(0)
 			for off := head; off != 0; {
 				n++
@@ -51,7 +51,7 @@ func (a *Arena) Stats() Stats {
 			}
 			s.FreeBlocksByClass[class] += n
 			free += n * sizeClasses[class]
-			unlockHead64(&r.freeHeads[class], head)
+			unlockHead64(&r.freeHeads[freeHeadIndex(class)], head)
 		}
 		s.FreeListBytes += free
 		if r.flags&regionReusable != 0 {

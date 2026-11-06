@@ -17,14 +17,15 @@ import (
 const (
 	RegionSize             = 2 * 1024 * 1024
 	TLABChunkSize          = 64 * 1024
-	SizeClassCount         = 18
+	SizeClassCount         = 19
+	Compact64Class         = 18 // 80 physical bytes, including a 16-byte header
 	MaxArenaSize           = 1<<32 - 1
 	MaxRegions             = (MaxArenaSize + RegionSize - 1) / RegionSize
 	NumTLABs               = 128
 	RelocationWatermark    = 0.40
 	HeaderSize             = uint64(unsafe.Sizeof(BlockHeader{}))
-	arenaMagic             = uint64(0x6164706172650001) // existing adaptive non-moving layout
-	compactArenaMagic      = uint64(0x6172656e61363402) // utils layout, version 2
+	arenaMagic             = uint64(0x6164706172650002) // non-moving layout, version 2
+	compactArenaMagic      = uint64(0x6172656e61363403) // default layout, version 3
 	regionReusable         = uint32(1)
 	regionPurged           = uint32(2)
 	modeNonMoving          = uint32(1)
@@ -38,6 +39,7 @@ const (
 var sizeClasses = [SizeClassCount]uint64{
 	64, 128, 272, 512, 1088, 1600, 2176, 4224, 8192,
 	8256, 16448, 32832, 65600, 131136, 262208, 524352, 1048640, RegionSize,
+	80, // 64-byte payload plus header; preserve the original class indices
 }
 
 // ArenaOptions selects reclamation policy on the shared allocator.
@@ -87,7 +89,7 @@ type Region struct {
 	users       atomic.Int32
 	evacuate    atomic.Uint32
 	freeHeads   [SizeClassCount]uint64
-	_           [SizeClassCount]uint32 // reserved: historical adaptive diagnostic counts
+	_           [16]uint32 // reserved; keep the mapped Region exactly 256 bytes
 	cursor      uint64
 	nextFree    uint64
 	flags       uint32
@@ -221,7 +223,7 @@ func GetSizeClass(size uint64) (int, uint64) {
 }
 
 func largeSizeClass(size uint64) (int, uint64) {
-	for i := 9; i < SizeClassCount; i++ {
+	for i := 9; i < 18; i++ {
 		if size <= sizeClasses[i] {
 			return i, sizeClasses[i]
 		}
@@ -229,6 +231,9 @@ func largeSizeClass(size uint64) (int, uint64) {
 	return -1, size
 }
 func GetExtendedSizeClass(size uint64) (int, uint64) {
+	if size > 64 && size <= 80 {
+		return Compact64Class, 80
+	}
 	class, total := GetSizeClass(size)
 	if class < 0 {
 		return largeSizeClass(total)
@@ -254,8 +259,8 @@ func (a *Arena) Alloc(size uint64) uint64 {
 		return 0
 	}
 	class, total := GetSizeClass(blockSize(size))
-	if class < 0 && a.mode.Load()&modeNonMoving != 0 {
-		class, total = largeSizeClass(total)
+	if a.mode.Load()&modeNonMoving != 0 {
+		class, total = GetExtendedSizeClass(blockSize(size))
 	}
 	if head, _, n := a.PopBatch(class, 1); n != 0 {
 		return head
@@ -304,8 +309,8 @@ func (a *Arena) AllocDense(size uint64) uint64 {
 		return 0
 	}
 	class, total := GetSizeClass(blockSize(size))
-	if class < 0 && a.mode.Load()&modeNonMoving != 0 {
-		class, total = largeSizeClass(total)
+	if a.mode.Load()&modeNonMoving != 0 {
+		class, total = GetExtendedSizeClass(blockSize(size))
 	}
 	if head, _, n := a.PopBatch(class, 1); n != 0 {
 		return head
@@ -373,7 +378,7 @@ func (a *Arena) PopBatch(classIdx int, max int) (headOff, tailOff uint64, count 
 	}
 	for r := int(startRegion); r >= 0; r-- {
 		region := &a.regions[r]
-		headAddr := &region.freeHeads[classIdx]
+		headAddr := &region.freeHeads[freeHeadIndex(classIdx)]
 		if region.evacuate.Load() == 1 || atomic.LoadUint64(headAddr) == 0 {
 			continue
 		}
@@ -428,10 +433,10 @@ func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 	for {
 		r := &a.regions[idx]
 		// Resolve the newest region directly; misses use the bitmap.
-		if (!first || atomic.LoadUint64(&r.freeHeads[class]) != 0) && r.evacuate.Load() == 0 {
+		if (!first || atomic.LoadUint64(&r.freeHeads[freeHeadIndex(class)]) != 0) && r.evacuate.Load() == 0 {
 			r.enter()
 			if r.evacuate.Load() == 0 {
-				head = lockHead64(&r.freeHeads[class])
+				head = lockHead64(&r.freeHeads[freeHeadIndex(class)])
 				if head != 0 {
 					tail = head
 					h := (*BlockHeader)(a.ptr(tail - HeaderSize))
@@ -447,14 +452,14 @@ func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 					r.activeCount.Add(int32(count))
 					r.liveBytes.Add(charged)
 					h.NextFree = 0
-					unlockHead64(&r.freeHeads[class], next)
+					unlockHead64(&r.freeHeads[freeHeadIndex(class)], next)
 					a.leaveRegion(idx)
 					return
 				}
 				if a.mode.Load()&modeIndexTracking != 0 {
 					a.clearAvailable(class, idx)
 				}
-				unlockHead64(&r.freeHeads[class], 0)
+				unlockHead64(&r.freeHeads[freeHeadIndex(class)], 0)
 			}
 			a.leaveRegion(idx)
 		}
@@ -470,6 +475,19 @@ func (a *Arena) popIndexedBatch(class, max int) (head, tail uint64, count int) {
 		mask &= mask - 1
 		idx = uint64((w-1)*64 + bit)
 	}
+}
+
+// Keep the original 64/128-byte heads and the compact 80-byte head beside
+// region claim counters. Class identifiers and availability masks stay logical;
+// only the private mapped head order changes with this class-table format.
+func freeHeadIndex(class int) int {
+	if class == Compact64Class {
+		return 2
+	}
+	if class >= 2 {
+		return class + 1
+	}
+	return class
 }
 
 // Free releases an owned block. No reader may retain its payload. An empty region
@@ -489,16 +507,16 @@ func (a *Arena) Free(offset uint64) {
 		r.evacuate.Store(1)
 	}
 	class, rounded := GetSizeClass(size)
-	if class < 0 && a.mode.Load()&modeNonMoving != 0 {
-		class, rounded = largeSizeClass(rounded)
+	if a.mode.Load()&modeNonMoving != 0 {
+		class, rounded = GetExtendedSizeClass(size)
 	}
 	if class != -1 && rounded == size && r.evacuate.Load() == 0 {
-		head := lockHead64(&r.freeHeads[class])
+		head := lockHead64(&r.freeHeads[freeHeadIndex(class)])
 		h.NextFree = head
 		if a.mode.Load()&modeIndexTracking != 0 {
 			a.setAvailable(class, idx)
 		}
-		unlockHead64(&r.freeHeads[class], offset)
+		unlockHead64(&r.freeHeads[freeHeadIndex(class)], offset)
 	}
 	// This block's claim protects its header until its free-list update is done.
 	if r.activeCount.Add(-1) == 0 {
@@ -524,13 +542,13 @@ func (a *Arena) enableIndexLocked() {
 	for idx := a.dataStart / RegionSize; idx < a.meta.nextRegion; idx++ {
 		r := &a.regions[idx]
 		for class := range r.freeHeads {
-			head := lockHead64(&r.freeHeads[class])
+			head := lockHead64(&r.freeHeads[freeHeadIndex(class)])
 			if head != 0 {
 				a.setAvailable(class, idx)
 			} else {
 				a.clearAvailable(class, idx)
 			}
-			unlockHead64(&r.freeHeads[class], head)
+			unlockHead64(&r.freeHeads[freeHeadIndex(class)], head)
 		}
 	}
 	a.mode.Or(modeIndexReady)
@@ -651,8 +669,8 @@ func (a *Arena) recycleRegion(idx uint64) {
 		return
 	}
 	for class := range r.freeHeads {
-		if atomic.LoadUint64(&r.freeHeads[class]) != 0 {
-			atomic.StoreUint64(&r.freeHeads[class], 0)
+		if atomic.LoadUint64(&r.freeHeads[freeHeadIndex(class)]) != 0 {
+			atomic.StoreUint64(&r.freeHeads[freeHeadIndex(class)], 0)
 		}
 		if a.mode.Load()&modeIndexTracking != 0 {
 			a.clearAvailable(class, idx)

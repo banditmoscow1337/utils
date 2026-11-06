@@ -84,7 +84,7 @@ func TestLayoutAndPointerFreeMetadata(t *testing.T) {
 }
 
 func TestSizeClassesIncludeHeaders(t *testing.T) {
-	for _, tc := range []struct{ payload, total uint64 }{{16, 64}, {64, 128}, {8192, 8256}, {8200, 8256}, {16384, 16448}, {RegionSize - HeaderSize, RegionSize}} {
+	for _, tc := range []struct{ payload, total uint64 }{{16, 64}, {48, 64}, {49, 80}, {64, 80}, {65, 128}, {8192, 8256}, {8200, 8256}, {16384, 16448}, {RegionSize - HeaderSize, RegionSize}} {
 		_, size := GetExtendedSizeClass(blockSize(tc.payload))
 		if size != tc.total {
 			t.Errorf("payload %d: size %d, want %d", tc.payload, size, tc.total)
@@ -96,7 +96,13 @@ func TestSizeClassesIncludeHeaders(t *testing.T) {
 			t.Fatalf("bad class %d", i)
 		}
 		if i > 0 {
-			class, _ = GetExtendedSizeClass(sizeClasses[i-1] + 1)
+			previous := uint64(0)
+			for _, candidate := range sizeClasses {
+				if candidate < size && candidate > previous {
+					previous = candidate
+				}
+			}
+			class, _ = GetExtendedSizeClass(previous + 1)
 			if class != i {
 				t.Fatalf("bad lower boundary of class %d", i)
 			}

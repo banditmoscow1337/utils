@@ -1,5 +1,7 @@
 package utils
 
+import "unsafe"
+
 // PayloadCapacity returns the usable bytes in an owned allocation, including
 // size-class slack, or zero for the nil offset. offset must be a payload start
 // returned by this Arena, not an interior pointer. The caller must retain its
@@ -12,8 +14,9 @@ func (a *Arena) PayloadCapacity(offset uint64) uint64 {
 	if a.basePtr == nil || offset >= a.size || offset&7 != 0 || offset < a.dataStart+HeaderSize {
 		panic("arena: invalid payload offset")
 	}
-	h := (*BlockHeader)(a.GetPtr(offset - HeaderSize))
 	start := offset - HeaderSize
+	// The bounds above already cover the header as well as the payload start.
+	h := (*BlockHeader)(unsafe.Add(a.basePtr, uintptr(start)))
 	size := h.Size
 	if size < HeaderSize || size&7 != 0 || size > a.regionEnd(start/RegionSize)-start {
 		panic("arena: invalid payload size")
